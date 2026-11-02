@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/p1neappleXpress/OpenFlux/socks5"
 	"github.com/p1neappleXpress/OpenFlux/transport"
 	"github.com/p1neappleXpress/OpenFlux/transport/registry"
 	"github.com/p1neappleXpress/OpenFlux/tunnel"
@@ -45,6 +46,8 @@ type packetClient struct {
 	logs      []string
 	// arrived is signalled when a packet is queued, for ReadTimeout.
 	arrived chan struct{}
+	tun     *tunnel.TCPTunnel
+	socks   *socks5.SOCKS5Server
 }
 
 // lowMemory selects the phone resource profile for the carriers of the
@@ -238,8 +241,12 @@ func newRawTransport(typ, url string, params map[string]interface{}, config tran
 func Stop() {
 	client.mu.Lock()
 	trans := client.transport
+	tun := client.tun
+	srv := client.socks
 	client.running = false
 	client.transport = nil
+	client.tun = nil
+	client.socks = nil
 	client.packets = nil
 	client.mu.Unlock()
 	detachPrompt()
@@ -247,6 +254,12 @@ func Stop() {
 	setAuthProxy(nil)
 	clearRoute()
 	appendLog("[ANDROID] Остановка транспорта")
+	if srv != nil {
+		_ = srv.Close() // разблокирует accept-горутину
+	}
+	if tun != nil {
+		tun.Close()
+	}
 	if trans != nil {
 		_ = trans.Stop()
 	}
