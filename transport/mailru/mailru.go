@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -238,6 +239,17 @@ func waitMailruSocketIO(session *DocSession, token string) error {
 	return nil
 }
 
+// ErrLoginRequired signals that Mail.ru's editor API refused the session
+// without a sign-in (r7/edit answers 401/403). The layer above opens
+// mailruLoginURL in a WebView; the captured cookies return via ApplyCookies.
+var ErrLoginRequired = errors.New("mailru docs: login required")
+
+// mailruLoginURL is what the WebView opens on ErrLoginRequired. Cloud drives
+// its own sign-in (Mail.ru ID / VK ID — we deliberately don't hardcode which
+// identity provider it federates to) and lands valid cloud.mail.ru cookies,
+// which is the jar domain this transport uses for csrfToken and r7/edit.
+const mailruLoginURL = "https://cloud.mail.ru/home/"
+
 type MailruDocsTransport struct {
 	*transport.BaseTransport
 
@@ -249,6 +261,11 @@ type MailruDocsTransport struct {
 
 	cookieJar *cookiejar.Jar
 	jarMu     sync.RWMutex
+
+	// errNotifier reports ErrLoginRequired up to the mobile/manager layer (set
+	// once via SetErrorNotifier before Start, so no lock). The WebView it opens
+	// returns the sign-in cookies via ApplyCookies.
+	errNotifier func(err error, transportName, url, html, reason string)
 
 	// reconnecting is set while a scheduled reconnect waits out its backoff:
 	// the reader's error and ApplyCookies both schedule one when the cookies
@@ -288,6 +305,14 @@ type MailruDocsTransport struct {
 	// the auth reply. A signed-in account has one editor id for all its connections (useridoriginal), so a frame
 	// from the account's other connection, the node of the same account, is told from our echo only by this one.
 	ourConns sync.Map
+}
+
+// SetErrorNotifier installs the out-of-band error callback (interface
+// transport.ErrorNotifier). Called once by the manager/mobile layer before
+// Start, so no lock is needed. mailru raises it with ErrLoginRequired when the
+// editor API refuses an unauthenticated session.
+func (t *MailruDocsTransport) SetErrorNotifier(fn func(err error, transportName, url, html, reason string)) {
+	t.errNotifier = fn
 }
 
 // mailruRecvQueue bounds the decoupling receive buffer (whole batches, so kept
@@ -509,6 +534,13 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 
 		session, err := t.dialAndAuth(userID, writeQueue)
 		if err != nil {
+			// A login wall is not a transient failure: ask the client to sign in
+			// (the WebView lands cookies via ApplyCookies). Throttle so a retry
+			// loop does not re-raise the prompt more than once a minute.
+			if errors.Is(err, ErrLoginRequired) && t.errNotifier != nil &&
+				utils.Throttled("m-docs.login", time.Minute) {
+				t.errNotifier(err, "mailru", mailruLoginURL, "", "login")
+			}
 			utils.Debugf("[M-DOCS] connect failed: %v", err)
 			if utils.Throttled("m-docs.fetch", time.Minute) {
 				utils.Infof("[M-DOCS] cannot open the document: %v; retrying", err)
@@ -1292,6 +1324,11 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// "public is available with auth only" — the session isn't signed in.
+		// Surface it as a login prompt instead of a silent backoff retry.
+		return MailruDocsInfo{}, ErrLoginRequired
+	}
 	if resp.StatusCode != http.StatusOK {
 		return MailruDocsInfo{}, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
