@@ -1252,30 +1252,114 @@ func reconnectBackoff(n int) time.Duration {
 	return d
 }
 
+// ensureSDC reissues the short-lived SDC cookie (sdcs) for the jar's signed-in
+// session. cloud.mail.ru answers {"error":"nosdc"} to its token and editor
+// APIs without a fresh one; a browser re-mints it silently, so an exported
+// sdcs is usually already stale. auth.mail.ru/sdc redirects back to the cloud
+// and lands a fresh sdcs from the login cookies (Mpop); we do it on every
+// connect so the exit self-heals as long as Mpop is alive.
+func (t *MailruDocsTransport) ensureSDC(client *http.Client) {
+	cloud, _ := url.Parse("https://cloud.mail.ru/")
+
+	// Drop ONLY the seeded sdcs before minting (ssdc/Mpop stay — they authorize
+	// the mint and are not IP-bound). The exported sdcs is bound to the browser's
+	// IP, so it is invalid from the node; worse, when the mint sets a fresh
+	// node-IP sdcs on a different scope, the server receives both, prefers the
+	// stale one, answers nosdc, and /home keeps bouncing back to re-mint (loop).
+	client.Jar.SetCookies(cloud, []*http.Cookie{
+		{Name: "sdcs", Value: "", Path: "/", Domain: "mail.ru", MaxAge: -1},
+	})
+
+	// Mint on a client that shares the jar but caps redirects. auth.mail.ru/sdc
+	// signs in with ssdc/Mpop and sends cloud.mail.ru/sdc a one-time token that
+	// sets a fresh node-IP sdcs; from=/home/ then loads. The cap guards against a
+	// server-side bounce spinning up to net/http's 10-redirect error.
+	mint := &http.Client{
+		Jar:       client.Jar,
+		Transport: client.Transport,
+		Timeout:   client.Timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 8 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
+
+	const from = "https://cloud.mail.ru/home/"
+	req, _ := http.NewRequest("GET", "https://auth.mail.ru/sdc?from="+url.QueryEscape(from), nil)
+	req.Header.Set("User-Agent", mailruUserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	resp, err := mint.Do(req)
+	if err != nil {
+		utils.Debugf("[M-DOCS] sdc mint failed: %v", err)
+		return
+	}
+	resp.Body.Close()
+	utils.Debugf("[M-DOCS] sdc mint: status %d, sdcs refreshed=%v",
+		resp.StatusCode, sdcsValue(client.Jar, cloud) != "")
+}
+
+// sdcsValue returns the jar's current sdcs value for u, or "" if none.
+func sdcsValue(jar http.CookieJar, u *url.URL) string {
+	if jar == nil {
+		return ""
+	}
+	for _, c := range jar.Cookies(u) {
+		if c.Name == "sdcs" {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+// accountEmail pulls the address out of an Mpop value, whose format is
+// "time:hash:email:...". Empty when it carries none.
+func accountEmail(mpop string) string {
+	parts := strings.Split(mpop, ":")
+	if len(parts) > 2 && strings.Contains(parts[2], "@") {
+		return parts[2]
+	}
+	return ""
+}
+
 // csrfToken asks Cloud for the token of the jar's session; "" when the jar
 // holds no sign-in (Cloud answers 403) or the call fails: the request then goes
 // out anonymously, as it did before Mail.ru wanted a login.
 func (t *MailruDocsTransport) csrfToken(client *http.Client) string {
-	req, _ := http.NewRequest("POST", "https://cloud.mail.ru/api/v2/tokens/csrf", nil)
+	req, _ := http.NewRequest("POST", "https://cloud.mail.ru/api/v3/tokens/csrf", nil)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("User-Agent", mailruUserAgent)
+	req.Header.Set("Origin", "https://cloud.mail.ru")
 	req.Header.Set("Referer", "https://cloud.mail.ru/home/")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	resp, err := client.Do(req)
 	if err != nil {
+		utils.Debugf("[M-DOCS] csrf request error: %v", err)
 		return ""
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode != http.StatusOK {
+		// The body carries the reason (e.g. nosdc); a 200 body holds the token,
+		// which we never log.
+		utils.Debugf("[M-DOCS] csrf v3: status %d body=%q", resp.StatusCode, strings.TrimSpace(string(body)))
 		return ""
 	}
+	// v3 returns the token flat ({"token":...}); v2 nested it under "body" —
+	// accept either so a server change doesn't silently empty the token.
 	var res struct {
-		Body struct {
+		Token string `json:"token"`
+		Body  struct {
 			Token string `json:"token"`
 		} `json:"body"`
 	}
-	if json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&res) != nil {
+	if json.Unmarshal(body, &res) != nil {
 		return ""
+	}
+	if res.Token != "" {
+		return res.Token
 	}
 	return res.Body.Token
 }
@@ -1295,8 +1379,26 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	}
 	client := &http.Client{Jar: jar, Timeout: 15 * time.Second, Transport: netbind.HTTPTransport(t.network())}
 
+	// Reissue the short-lived SDC cookie first — without a fresh one the token
+	// and editor APIs answer {"error":"nosdc"} even with valid login cookies.
+	t.ensureSDC(client)
+
+	// The editor call wants the account's own email; the API still reads the
+	// account from the cookies, so "anonym" is the fallback when Mpop has none.
+	email := "anonym"
+	if u, e := url.Parse("https://cloud.mail.ru/"); e == nil {
+		for _, c := range jar.Cookies(u) {
+			if c.Name == "Mpop" {
+				if m := accountEmail(c.Value); m != "" {
+					email = m
+				}
+				break
+			}
+		}
+	}
+
 	reqBody := map[string]string{
-		"x-email":  "anonym",
+		"x-email":  email,
 		"public":   "/" + weblink,
 		"platform": "desktop_web",
 	}
@@ -1310,6 +1412,10 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	// only", 401); with the sign-in's cookies it needs the CSRF token too.
 	if token := t.csrfToken(client); token != "" {
 		req.Header.Set("X-CSRF-Token", token)
+		req.Header.Set("X-Email", email)
+		utils.Debugf("[M-DOCS] csrf token obtained (%d chars)", len(token))
+	} else {
+		utils.Debugf("[M-DOCS] csrf token EMPTY — sending r7/edit without X-CSRF-Token (sdc mint/login failed?)")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -1324,12 +1430,17 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		// "public is available with auth only" — the session isn't signed in.
-		// Surface it as a login prompt instead of a silent backoff retry.
-		return MailruDocsInfo{}, ErrLoginRequired
-	}
 	if resp.StatusCode != http.StatusOK {
+		// Log what Mail.ru actually said — a 403 on an authenticated jar means
+		// "this account may not edit this document", not "not signed in"; the
+		// body carries the real reason (shown at -dd).
+		peek, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		utils.Debugf("[M-DOCS] r7/edit %d body: %s", resp.StatusCode, strings.TrimSpace(string(peek)))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			// "public is available with auth only" — the session isn't signed in.
+			// Surface it as a login prompt instead of a silent backoff retry.
+			return MailruDocsInfo{}, ErrLoginRequired
+		}
 		return MailruDocsInfo{}, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
@@ -1421,7 +1532,11 @@ func (t *MailruDocsTransport) ApplyCookies(values map[string]string) error {
 	jar, _ := cookiejar.New(nil)
 	cookies := make([]*http.Cookie, 0, len(values))
 	for k, v := range values {
-		cookies = append(cookies, &http.Cookie{Name: k, Value: v, Path: "/"})
+		// Scope to the whole mail.ru domain, not host-only on cloud.mail.ru:
+		// the SDC mint hits auth.mail.ru and must carry the login cookies, and
+		// in the browser Mpop lives on .mail.ru. A host-only cloud cookie never
+		// reaches auth.mail.ru, so the mint can't sign in (see ensureSDC).
+		cookies = append(cookies, &http.Cookie{Name: k, Value: v, Path: "/", Domain: "mail.ru"})
 	}
 	jar.SetCookies(u, cookies)
 
