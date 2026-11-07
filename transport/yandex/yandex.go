@@ -33,6 +33,21 @@ var ErrCaptchaRequired = errors.New("yandex docs: captcha required")
 // document is not public from this IP / account.
 var ErrLoginRequired = errors.New("yandex docs: login required")
 
+// PromptError carries the page the client should open to clear the wall — the
+// SmartCaptcha challenge or the login page itself — so the WebView opens THAT,
+// not the live document. Opening the document in a WebView while the transport
+// is editing it collides in Volga's co-editing engine and deadlocks the editor
+// ("DeadlockError: bundles invalidated by command manager"); the standalone
+// challenge/login page has no such collision. Unwraps to ErrCaptchaRequired or
+// ErrLoginRequired so existing errors.Is checks keep working.
+type PromptError struct {
+	URL  string
+	Kind error
+}
+
+func (e *PromptError) Error() string { return e.Kind.Error() + " @ " + e.URL }
+func (e *PromptError) Unwrap() error  { return e.Kind }
+
 // Precompiled once. cursorPayloadRe in particular runs on every inbound
 // message, so compiling it per call (as before) was pure overhead on the hot
 // receive path.

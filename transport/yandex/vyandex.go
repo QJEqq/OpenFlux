@@ -229,14 +229,16 @@ func authorizeWithJar(docURL string, jar http.CookieJar) (*volgaAuth, error) {
 				return nil, fmt.Errorf("redirect without Location from %s", currentURL)
 			}
 
-			// Second-tier captcha (SmartCaptcha): cannot be solved with PoW.
+			// Second-tier captcha (SmartCaptcha): cannot be solved with PoW. Hand
+			// the WebView the challenge page itself (loc), not the document — opening
+			// the live doc collides with the transport's editing and deadlocks it.
 			if strings.Contains(loc, "showcaptcha") && !strings.Contains(loc, "showcaptchafast") {
 				utils.Debugf("[VOLGA] SmartCaptcha detected, external solver required")
-				return nil, ErrCaptchaRequired
+				return nil, &PromptError{URL: resolveLocation(currentURL, loc), Kind: ErrCaptchaRequired}
 			}
 
 			if strings.Contains(loc, "passport.yandex") {
-				return nil, ErrLoginRequired
+				return nil, &PromptError{URL: resolveLocation(currentURL, loc), Kind: ErrLoginRequired}
 			}
 
 			if strings.Contains(loc, "showcaptchafast") {
@@ -1261,8 +1263,16 @@ func (t *YandexVolgaTransport) Start() error {
 			if errors.Is(err, ErrLoginRequired) {
 				reason = "login"
 			}
+			// Open the challenge/login page itself, not the document: a WebView on
+			// the live doc collides with the transport's co-editing and deadlocks
+			// Volga's editor (bundles invalidated by command manager).
+			promptURL := t.docURL
+			var pe *PromptError
+			if errors.As(err, &pe) && pe.URL != "" {
+				promptURL = pe.URL
+			}
 			if t.errNotifier != nil {
-				t.errNotifier(err, "vyandex", t.docURL, "", reason)
+				t.errNotifier(err, "vyandex", promptURL, "", reason)
 			}
 		}
 		return fmt.Errorf("auth: %w", err)
