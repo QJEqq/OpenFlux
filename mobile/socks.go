@@ -43,7 +43,7 @@ func startSocks(socksAddr string, build func() (transport.Transport, error)) str
 		client.mu.Lock()
 		client.running = false
 		client.mu.Unlock()
-		detachCaptcha()
+		detachPrompt() // 0.17 переименовал captcha → prompt (коммит 1fd2f23)
 		setAuthProxy(nil)
 		return err.Error()
 	}
