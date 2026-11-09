@@ -17,6 +17,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,6 +92,13 @@ type nodeWizard struct {
 	newRooms  func(context.Context) (string, error)
 	// newAvitoRooms makes Avito Code rooms; they need no sign-in.
 	newAvitoRooms func(context.Context) (string, error)
+	// newBoard makes a Yandex board on an operator's account (its cookies)
+	// and returns its share URL; unlike rooms, creating a board needs a
+	// signed-in account.
+	newBoard func(ctx context.Context, cookies map[string]string, name string) (string, error)
+	// newVolgaDoc makes a Yandex document (volga/vyandex) on an operator's
+	// account and returns its editor URL, shared edit-by-link.
+	newVolgaDoc func(ctx context.Context, cookies map[string]string) (string, error)
 }
 
 func newNodeWizard() *nodeWizard {
@@ -102,6 +110,8 @@ func newNodeWizard() *nodeWizard {
 		newAvitoRooms: func(ctx context.Context) (string, error) {
 			return avito.CreateRoomList(ctx, "")
 		},
+		newBoard:    yandex.CreateBoard,
+		newVolgaDoc: yandex.CreateVolgaDoc,
 	}
 }
 
@@ -148,6 +158,35 @@ func wizardFailure(err error, extra map[string]interface{}) map[string]interface
 		fields[k] = v
 	}
 	return fields
+}
+
+// cookiesUnion decodes the base64 cookie store ({url: {name: value}}, as
+// provision.CookieStore writes it) into one name->value map. A Yandex session
+// cookie (Session_id, L, ...) is domain-wide, so its value is the same under
+// whichever document URL the store filed it, and the union is what boards
+// create needs — there is no document URL yet to key on.
+func cookiesUnion(store string) (map[string]string, error) {
+	if strings.TrimSpace(store) == "" {
+		return nil, errors.New("нет cookies Яндекса")
+	}
+	raw, err := base64.StdEncoding.DecodeString(store)
+	if err != nil {
+		return nil, errors.New("неверные cookies")
+	}
+	var byURL map[string]map[string]string
+	if err := json.Unmarshal(raw, &byURL); err != nil {
+		return nil, errors.New("неверные cookies")
+	}
+	out := map[string]string{}
+	for _, jar := range byURL {
+		for k, v := range jar {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("нет cookies Яндекса")
+	}
+	return out, nil
 }
 
 func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
@@ -311,6 +350,36 @@ func (w *nodeWizard) handle(req wizardRequest) map[string]interface{} {
 			return wizardFailure(fmt.Errorf("не удалось создать комнаты Avito: %v", err), nil)
 		}
 		return wizardOK(map[string]interface{}{"rooms": rooms})
+	case "createBoard":
+		// Unlike the room creators, a board needs a signed-in operator; its
+		// cookies arrive as the same base64 cookie store the rest of the
+		// protocol uses. The answer is the board's share URL for a boards
+		// transport.
+		cookies, err := cookiesUnion(p.Cookies)
+		if err != nil {
+			return wizardFailure(err, nil)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		boardURL, err := w.newBoard(ctx, cookies, p.Name)
+		if err != nil {
+			return wizardFailure(fmt.Errorf("не удалось создать доску Яндекса: %v", err), nil)
+		}
+		return wizardOK(map[string]interface{}{"url": boardURL})
+	case "createVolgaDoc":
+		// Like createBoard but for a volga/vyandex document; needs a signed-in
+		// operator (cookies from the same base64 store).
+		cookies, err := cookiesUnion(p.Cookies)
+		if err != nil {
+			return wizardFailure(err, nil)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		docURL, err := w.newVolgaDoc(ctx, cookies)
+		if err != nil {
+			return wizardFailure(fmt.Errorf("не удалось создать документ Яндекса: %v", err), nil)
+		}
+		return wizardOK(map[string]interface{}{"url": docURL})
 	case "shareLink":
 		link, err := provision.ShareLinkContext(p.Name, p.Key, p.Host, p.ChannelPort, p.transports(), p.Context)
 		if err != nil {
