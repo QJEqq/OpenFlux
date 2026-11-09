@@ -309,6 +309,7 @@ func main() {
 	mailruURL := flag.String("mailru-url", "", "URL (weblink) for the mailru transport")
 	cupsonlineURL := flag.String("cupsonline-url", "", "URL for the cupsonline transport")
 	avitoURL := flag.String("avito-url", "", "URL for the avito transport")
+	telemostURL := flag.String("telemost-url", "", "URL (conference link) for the telemost transport")
 	avitoCookies := flag.String("avito-cookies", "", "Raw cookie string for code.avito.ru (or path to Netscape cookies.txt)")
 	onemeToken := flag.String("oneme-token", "", "MAX token for the oneme transport")
 	onemeUID := flag.String("oneme-uid", "", "MAX uid for the oneme transport")
@@ -848,6 +849,7 @@ DEPRECATED (removed in v2)
 			"mailru":     *mailruURL,
 			"cupsonline": *cupsonlineURL,
 			"avito":      *avitoURL,
+			"telemost":   *telemostURL,
 		}
 		specs = buildTransportSpecs(specs, urls, nil)
 	} else if *transportsFlag != "" {
@@ -862,6 +864,7 @@ DEPRECATED (removed in v2)
 			"mailru":     *mailruURL,
 			"cupsonline": *cupsonlineURL,
 			"avito":      *avitoURL,
+			"telemost":   *telemostURL,
 		}
 		if globalDocUrl != "" && globalDocUrl != "http://#" && urls["yandex"] == "" {
 			urls["yandex"] = globalDocUrl
