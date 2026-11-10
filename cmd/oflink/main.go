@@ -34,7 +34,18 @@ func main() {
 	context := flag.String("context", "", "encryption context; empty derives it (new channel)")
 	transportsJSON := flag.String("transports", "[]", `JSON array of {"type","url"} besides direct`)
 	prioritiesFlag := flag.String("priorities", "", `carrier priorities, e.g. "direct:100,boards:70,vyandex:50" (empty: provision's)`)
+	noDirect := flag.Bool("no-direct", false, "leave direct out: the node opens no port, the channel rides only its relays (boards, vyandex, ...)")
 	flag.Parse()
+	if *noDirect {
+		// provision builds the direct carrier from these and wants them set;
+		// adjustLink drops it again.
+		if *host == "" {
+			*host = "127.0.0.1"
+		}
+		if *port == 0 {
+			*port = 1
+		}
+	}
 
 	var ts []provision.ChannelTransport
 	if err := json.Unmarshal([]byte(*transportsJSON), &ts); err != nil {
@@ -49,7 +60,7 @@ func main() {
 
 	link, err := provision.ShareLinkContext(*name, *key, *host, *port, ts, *context)
 	if err == nil {
-		link, err = adjustLink(link, ts, prios)
+		link, err = adjustLink(link, ts, prios, *noDirect)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -82,30 +93,42 @@ func parsePriorities(s string) (map[string]int, error) {
 //   - the carrier priorities the augmenter chose (--priorities). A Session sends
 //     through the live carrier of the highest priority, so the order decides
 //     which carrier takes the traffic (direct, when live, wins anyway).
+//   - no direct carrier (--no-direct) for a node that must open no port: many
+//     open odd ports give a node away to DPI, and a client dialling one would
+//     too. The channel then rides only its relays.
 //
 // The encryption context does not depend on carrier URLs or priorities
 // (explicit, or the fixed placeholder), so nothing else in the link changes.
-func adjustLink(link string, ts []provision.ChannelTransport, prios map[string]int) (string, error) {
+func adjustLink(link string, ts []provision.ChannelTransport, prios map[string]int, noDirect bool) (string, error) {
 	keep := false
 	for _, t := range ts {
 		if u, err := url.Parse(strings.TrimSpace(t.URL)); t.Type == "vyandex" && err == nil && u.Query().Get("source") == "docs" {
 			keep = true
 		}
 	}
-	if !keep && len(prios) == 0 {
+	if !keep && len(prios) == 0 && !noDirect {
 		return link, nil
 	}
 	c, err := share.Decode(link)
 	if err != nil {
 		return "", err
 	}
-	for i, t := range c.Transports {
+	out := c.Transports[:0]
+	for _, t := range c.Transports {
+		if noDirect && t.Type == "direct" {
+			continue
+		}
 		if keep && t.Type == "vyandex" && !strings.Contains(t.URL, "?") {
-			c.Transports[i].URL += "?source=docs"
+			t.URL += "?source=docs"
 		}
 		if p, ok := prios[t.Type]; ok {
-			c.Transports[i].Priority = p
+			t.Priority = p
 		}
+		out = append(out, t)
 	}
+	if len(out) == 0 {
+		return "", fmt.Errorf("без direct в канале нет ни одного носителя (доска/документ не заданы)")
+	}
+	c.Transports = out
 	return share.MakeLink(c)
 }
