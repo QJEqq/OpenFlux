@@ -1,0 +1,24 @@
+# OpenFlux node (ofnode), remnanode-style: the augmenter's "add node" hands out
+# this file with SECRET_KEY filled in; on the node run `docker compose up -d`.
+# Firewall (ufw): NODE_PORT only from the panel, PORT_RANGE open to clients:
+#   ufw allow from <panel-ip> to any port 2223 proto tcp
+#   ufw allow 20000:29999/tcp
+services:
+  openflux-node:
+    image: ${OPENFLUX_NODE_IMAGE:-openflux-node:local}
+    container_name: openflux-node
+    restart: always
+    # Channels listen on host ports (direct) and an l3 exit answers its
+    # clients' packets with raw sockets on the host's address.
+    network_mode: host
+    cap_add: [NET_RAW, NET_ADMIN]
+    environment:
+      NODE_PORT: "2223"
+      PORT_RANGE: "20000-29999"
+      SECRET_KEY: "${SECRET_KEY:?SECRET_KEY from the augmenter}"
+    volumes:
+      - openflux-node-data:/var/lib/openflux-node
+
+volumes:
+  openflux-node-data:
+    name: openflux-node-data

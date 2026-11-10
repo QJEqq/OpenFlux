@@ -1,0 +1,10 @@
+# openflux-node from prebuilt linux binaries (no Go toolchain on the server):
+# put `openflux` and `ofnode` (GOOS=linux, the node's GOARCH) next to this
+# file and build in that folder:
+#   docker build -f Dockerfile.bin -t openflux-node:local .
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates iptables
+COPY openflux ofnode /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/openflux /usr/local/bin/ofnode
+VOLUME /var/lib/openflux-node
+ENTRYPOINT ["/usr/local/bin/ofnode", "serve"]
