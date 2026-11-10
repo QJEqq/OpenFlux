@@ -21,6 +21,9 @@ type channelSpec struct {
 	Transports []transportSpec `json:"transports"`
 	Cookies    string          `json:"cookies"`    // base64 cookie-store JSON, for a Yandex/Mail.ru document
 	Priorities map[string]int  `json:"priorities"` // carrier type -> priority; missing types keep the defaults
+	// NoDirect leaves the direct carrier out: the node opens no port (many open
+	// odd ports give a node away to DPI) and the channel rides only its relays.
+	NoDirect bool `json:"no_direct"`
 }
 
 type transportSpec struct {
@@ -67,6 +70,9 @@ func (s *channelSpec) validate() error {
 	case "l3", "l4":
 	default:
 		return fmt.Errorf("режим ноды: l4 или l3")
+	}
+	if s.NoDirect && len(s.Transports) == 0 {
+		return fmt.Errorf("без direct каналу нужен хоть один носитель (доска, документ)")
 	}
 	seen := map[string]bool{}
 	doc := false
@@ -151,7 +157,9 @@ func nodeConf(s *channelSpec, dir string, port int) string {
 			fmt.Fprintf(&b, "\n[Transport %s]\nType = %s\nPriority = %d\nURL = %s\n", typ, typ, s.priority(typ), u)
 		}
 	}
-	fmt.Fprintf(&b, "\n[Transport direct]\nType = direct\nPriority = %d\nListen = 0.0.0.0:%d\n", s.priority("direct"), port)
+	if !s.NoDirect {
+		fmt.Fprintf(&b, "\n[Transport direct]\nType = direct\nPriority = %d\nListen = 0.0.0.0:%d\n", s.priority("direct"), port)
+	}
 	return b.String()
 }
 

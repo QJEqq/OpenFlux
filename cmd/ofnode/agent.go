@@ -138,9 +138,12 @@ func (a *agent) apply(s channelSpec) (int, error) {
 	for _, c := range a.chans {
 		taken[c.port] = true
 	}
-	port, err := pickPort(a.lo, a.hi, taken)
-	if err != nil {
-		return 0, err
+	port := 0 // no direct: the channel listens on nothing
+	if !s.NoDirect {
+		var err error
+		if port, err = pickPort(a.lo, a.hi, taken); err != nil {
+			return 0, err
+		}
 	}
 	dir := filepath.Join(a.dir, s.Channel)
 	if err := writeChannel(dir, &s, port); err != nil {
@@ -452,7 +455,11 @@ func (a *agent) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
 	}
-	log.Printf("[ofnode] + %s: порт %d, режим %s, %d носителей + direct", s.Channel, port, s.Mode, len(s.Transports))
+	direct := fmt.Sprintf("+ direct :%d", port)
+	if s.NoDirect {
+		direct = "без direct, портов не открыто"
+	}
+	log.Printf("[ofnode] + %s: режим %s, %d носителей %s", s.Channel, s.Mode, len(s.Transports), direct)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "channel": s.Channel, "port": port})
 }
 

@@ -363,3 +363,28 @@ func TestL3NeedsTheRSTRule(t *testing.T) {
 		t.Fatalf("l4: %v", err)
 	}
 }
+
+// No direct: many open odd ports give a node away to DPI, so the channel
+// listens on nothing and rides only its relays.
+func TestNoDirectOpensNoPort(t *testing.T) {
+	a := newTestAgent(t, "run", t.TempDir(), &fakeIPT{rules: map[string]bool{}})
+	s := testSpec()
+	s.NoDirect = true
+	port, err := a.apply(s)
+	if err != nil || port != 0 {
+		t.Fatalf("apply: port %d, err %v", port, err)
+	}
+	conf, _ := os.ReadFile(filepath.Join(a.dir, s.Channel, "node.conf"))
+	if strings.Contains(string(conf), "[Transport direct]") || strings.Contains(string(conf), "Listen =") ||
+		!strings.Contains(string(conf), "[Transport boards]") {
+		t.Fatalf("node.conf:\n%s", conf)
+	}
+	if st := waitState(t, a, s.Channel, "running"); st.Port != 0 {
+		t.Fatalf("status %+v", st)
+	}
+	empty := testSpec()
+	empty.NoDirect, empty.Transports, empty.Cookies = true, nil, ""
+	if err := empty.validate(); err == nil {
+		t.Fatal("a channel with no carrier at all accepted")
+	}
+}
