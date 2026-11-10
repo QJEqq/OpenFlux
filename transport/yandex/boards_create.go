@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -21,22 +22,28 @@ import (
 // without a human opening boards.yandex.ru.
 //
 // cookies are the operator's Yandex session cookies (Session_id, sessionid2,
-// L, ...), domain-wide for .yandex.ru. access_type 10 is the cabinet's default
-// for a new board; the exit and the client both join it as guests (see
-// BoardsTransport.authorize → request-guest-token), which that level allows.
+// L, ...), domain-wide for .yandex.ru. The exit and the client both join the
+// board as guests (see BoardsTransport.authorize → request-guest-token).
 //
 // CSRF is bootstrapped at runtime, exactly as the cabinet SPA does it
 // (lib.cabinet.js wbpost): POST /api init-csrf needs no prior token and
-// returns a fresh csrf JWT, which make-whiteboard then requires. The token
-// rotates on every response, so a single create needs only this one.
+// returns a fresh csrf JWT; every owner call carries the latest one, and a
+// csrf in an answer replaces it.
+//
+// A board made with make-whiteboard alone is not open to guests: live, its
+// request-guest-token answered {"redirect":"https://boards.yandex.ru"} with no
+// token_<hash>, so the boards carrier could never join, while a board its
+// owner had opened in the browser worked — its presentation carries
+// guest_mode:true, guest_role:1. Neither starting the board nor its link role
+// (access_type) opens it; switching guest mode on (update-dashboard-presentation)
+// does, live, a few seconds later. So the board is started the way the cabinet
+// does when its owner opens it (start-whiteboard), guest mode is switched on,
+// and the board is checked as an anonymous guest until it lets one in
+// (boardsGuestWait). A board guests cannot join is an error, not a dead carrier.
 func CreateBoard(ctx context.Context, cookies map[string]string, name string) (string, error) {
 	if len(cookies) == 0 {
 		return "", fmt.Errorf("нет cookies Яндекса")
 	}
-	if name == "" {
-		name = "Доска"
-	}
-
 	jar, _ := cookiejar.New(nil)
 	u, _ := url.Parse("https://" + boardsBase + "/")
 	cs := make([]*http.Cookie, 0, len(cookies))
@@ -44,25 +51,137 @@ func CreateBoard(ctx context.Context, cookies map[string]string, name string) (s
 		cs = append(cs, &http.Cookie{Name: k, Value: v, Path: "/"})
 	}
 	jar.SetCookies(u, cs)
-
-	client := &http.Client{
-		Jar:       jar,
+	owner := &http.Client{Jar: jar, Transport: carrierTransport(""), Timeout: 20 * time.Second}
+	guest := &http.Client{
 		Transport: carrierTransport(""),
 		Timeout:   20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
+	return createBoard(ctx, owner, guest, name)
+}
 
-	csrf, err := boardsInitCSRF(ctx, client)
+// createBoard is CreateBoard with its two clients: owner carries the operator's
+// sign-in, guest none (each check starts from an empty jar).
+func createBoard(ctx context.Context, owner, guest *http.Client, name string) (string, error) {
+	if name == "" {
+		name = "Доска"
+	}
+	csrf, err := boardsInitCSRF(ctx, owner)
 	if err != nil {
 		return "", fmt.Errorf("init-csrf: %w", err)
 	}
-	hash, err := boardsMakeWhiteboard(ctx, client, name, csrf)
+	hash, csrf, err := boardsMakeWhiteboard(ctx, owner, name, csrf)
 	if err != nil {
 		return "", fmt.Errorf("make-whiteboard: %w", err)
 	}
 	if !isBoardHash(hash) {
 		return "", fmt.Errorf("make-whiteboard вернул неожиданный hash %q", shortStr(hash, 40))
 	}
-	return "https://" + boardsBase + "/whiteboard/?hash=" + hash, nil
+	boardURL := "https://" + boardsBase + "/whiteboard/?hash=" + hash
+
+	if csrf, err = boardsOwnerCall(ctx, owner, "start-whiteboard", map[string]interface{}{"hash": hash}, csrf); err != nil {
+		return "", fmt.Errorf("start-whiteboard: %w", err)
+	}
+	// Guest mode is a property of the presentation: the boards guests can join
+	// carry guest_mode:true, guest_role:1 (seen in get-whiteboard-info). The
+	// editor writes properties with update-dashboard-presentation; the cabinet
+	// only has the switch-off (disable-presentation-guest-mode).
+	if _, err = boardsOwnerCall(ctx, owner, "update-dashboard-presentation", map[string]interface{}{
+		"media": hash,
+		"properties": map[string]interface{}{
+			"guest_mode": true, "guest_role": 1, "guest_password": nil, "guest_password_expiration_date": nil,
+		},
+	}, csrf); err != nil {
+		return "", fmt.Errorf("update-dashboard-presentation: %w", err)
+	}
+	// Guest mode lands a few seconds after the update (live: an immediate check
+	// was refused, the same board let a guest in moments later), so the check
+	// polls instead of judging the first answer.
+	var why string
+	for i := 0; i < boardsGuestChecks; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("доска %s: гостевая проверка прервана: %w", hash, ctx.Err())
+			case <-time.After(boardsGuestWait):
+			}
+		}
+		var open bool
+		if open, why = boardsGuestCanJoin(ctx, guest, hash); open {
+			return boardURL, nil
+		}
+	}
+	return "", fmt.Errorf("доска %s создана, но гостей не пускает: %s", hash, why)
+}
+
+// How long createBoard waits for guest mode to take effect: boardsGuestChecks
+// tries, boardsGuestWait apart (variables so tests can shorten the wait).
+var (
+	boardsGuestChecks = 8
+	boardsGuestWait   = 2 * time.Second
+)
+
+// boardsOwnerCall makes one owner (cabinet) call the way wbpost does: the
+// current csrf goes into the content, and a csrf in the answer replaces it.
+// It returns the csrf to use next.
+func boardsOwnerCall(ctx context.Context, client *http.Client, action string, content map[string]interface{}, csrf string) (string, error) {
+	content["csrf"] = csrf
+	req, err := boardsCabinetRequest(ctx, action, content)
+	if err != nil {
+		return csrf, err
+	}
+	var r struct {
+		CSRF  string          `json:"csrf"`
+		Error *boardsAPIError `json:"error"`
+	}
+	if err := boardsDo(client, req, &r); err != nil {
+		return csrf, err
+	}
+	if r.Error != nil {
+		return csrf, r.Error
+	}
+	if r.CSRF != "" {
+		csrf = r.CSRF
+	}
+	return csrf, nil
+}
+
+// boardsGuestCanJoin checks the board the way the boards carrier joins it, as
+// an anonymous guest from an empty jar: GET the board, then request-guest-token
+// must set token_<hash>. A captcha or a network error cannot tell either way
+// and counts as open (the carrier solves the PoW captcha itself); a refusal
+// comes back with the server's answer.
+func boardsGuestCanJoin(ctx context.Context, guest *http.Client, hash string) (bool, string) {
+	c := *guest
+	c.Jar, _ = cookiejar.New(nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+boardsBase+"/whiteboard/?hash="+hash, nil)
+	req.Header.Set("User-Agent", boardsUA)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	resp, err := c.Do(req)
+	if err != nil {
+		return true, "не проверить: " + err.Error()
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if loc := resp.Header.Get("Location"); strings.Contains(loc, "captcha") {
+		return true, "не проверить: капча"
+	}
+	tokenReq := apiRequest(hash, "request-guest-token", map[string]string{"name": "guest_" + randomHex(3), "hash": hash}).WithContext(ctx)
+	resp, err = c.Do(tokenReq)
+	if err != nil {
+		return true, "не проверить: " + err.Error()
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<12))
+	resp.Body.Close()
+	u, _ := url.Parse("https://" + boardsBase + "/")
+	for _, ck := range c.Jar.Cookies(u) {
+		if ck.Name == "token_"+hash {
+			return true, ""
+		}
+	}
+	return false, "request-guest-token → " + shortStr(strings.TrimSpace(string(body)), 120)
 }
 
 // boardsCabinetRequest builds an authenticated POST /api call from the cabinet
@@ -141,27 +260,32 @@ func boardsInitCSRF(ctx context.Context, client *http.Client) (string, error) {
 	return r.CSRF, nil
 }
 
-// boardsMakeWhiteboard creates the board and returns its hash.
-func boardsMakeWhiteboard(ctx context.Context, client *http.Client, name, csrf string) (string, error) {
+// boardsMakeWhiteboard creates the board and returns its hash and the csrf to
+// use next. access_type 10 is what the cabinet's "Новая доска" sends.
+func boardsMakeWhiteboard(ctx context.Context, client *http.Client, name, csrf string) (string, string, error) {
 	req, err := boardsCabinetRequest(ctx, "make-whiteboard", map[string]interface{}{
 		"name":        name,
 		"access_type": 10,
 		"csrf":        csrf,
 	})
 	if err != nil {
-		return "", err
+		return "", csrf, err
 	}
 	var r struct {
 		Hash  string          `json:"hash"`
+		CSRF  string          `json:"csrf"`
 		Error *boardsAPIError `json:"error"`
 	}
 	if err := boardsDo(client, req, &r); err != nil {
-		return "", err
+		return "", csrf, err
 	}
 	if r.Error != nil {
-		return "", r.Error
+		return "", csrf, r.Error
 	}
-	return r.Hash, nil
+	if r.CSRF != "" {
+		csrf = r.CSRF
+	}
+	return r.Hash, csrf, nil
 }
 
 // isBoardHash reports whether h is a 32-char lowercase-hex board hash, the
