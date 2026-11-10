@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/p1neappleXpress/OpenFlux/provision"
@@ -32,6 +33,7 @@ func main() {
 	port := flag.Int("port", 0, "direct backup port the node picked")
 	context := flag.String("context", "", "encryption context; empty derives it (new channel)")
 	transportsJSON := flag.String("transports", "[]", `JSON array of {"type","url"} besides direct`)
+	prioritiesFlag := flag.String("priorities", "", `carrier priorities, e.g. "direct:100,boards:70,vyandex:50" (empty: provision's)`)
 	flag.Parse()
 
 	var ts []provision.ChannelTransport
@@ -39,10 +41,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bad --transports json:", err)
 		os.Exit(1)
 	}
+	prios, err := parsePriorities(*prioritiesFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bad --priorities:", err)
+		os.Exit(1)
+	}
 
 	link, err := provision.ShareLinkContext(*name, *key, *host, *port, ts, *context)
 	if err == nil {
-		link, err = keepVolgaSource(link, ts)
+		link, err = adjustLink(link, ts, prios)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -51,22 +58,41 @@ func main() {
 	fmt.Println(link)
 }
 
-// keepVolgaSource puts ?source=docs back on the link's vyandex carrier when the
-// caller's URL had it. provision cleans every carrier link down to
-// /edit/d/<id>, but without that query docs.yandex.ru opens the document in the
-// legacy editor, whose page has no officeActionData, and vyandex fails with
-// "action_url missing". The AVACA augmenter's node-install.sh keeps the query
-// in node.conf, so the link must carry the same URL. The encryption context
-// does not depend on carrier URLs (explicit, or the fixed placeholder), so
-// nothing else in the link changes.
-func keepVolgaSource(link string, ts []provision.ChannelTransport) (string, error) {
+// parsePriorities reads "type:N,type:N" (N 0-999) into a map.
+func parsePriorities(s string) (map[string]int, error) {
+	out := map[string]int{}
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' }) {
+		typ, num, ok := strings.Cut(part, ":")
+		n, err := strconv.Atoi(num)
+		if !ok || typ == "" || err != nil || n < 0 || n > 999 {
+			return nil, fmt.Errorf("%q: нужно тип:число (0-999)", part)
+		}
+		out[typ] = n
+	}
+	return out, nil
+}
+
+// adjustLink applies what the AVACA augmenter's node-install.sh writes into
+// node.conf and provision does not, so the link and node.conf agree:
+//
+//   - ?source=docs goes back on the vyandex carrier when the caller's URL had
+//     it. provision cleans every carrier link down to /edit/d/<id>, but without
+//     that query docs.yandex.ru opens the document in the legacy editor, whose
+//     page has no officeActionData, and vyandex fails with "action_url missing".
+//   - the carrier priorities the augmenter chose (--priorities). A Session sends
+//     through the live carrier of the highest priority, so the order decides
+//     which carrier takes the traffic (direct, when live, wins anyway).
+//
+// The encryption context does not depend on carrier URLs or priorities
+// (explicit, or the fixed placeholder), so nothing else in the link changes.
+func adjustLink(link string, ts []provision.ChannelTransport, prios map[string]int) (string, error) {
 	keep := false
 	for _, t := range ts {
 		if u, err := url.Parse(strings.TrimSpace(t.URL)); t.Type == "vyandex" && err == nil && u.Query().Get("source") == "docs" {
 			keep = true
 		}
 	}
-	if !keep {
+	if !keep && len(prios) == 0 {
 		return link, nil
 	}
 	c, err := share.Decode(link)
@@ -74,8 +100,11 @@ func keepVolgaSource(link string, ts []provision.ChannelTransport) (string, erro
 		return "", err
 	}
 	for i, t := range c.Transports {
-		if t.Type == "vyandex" && !strings.Contains(t.URL, "?") {
+		if keep && t.Type == "vyandex" && !strings.Contains(t.URL, "?") {
 			c.Transports[i].URL += "?source=docs"
+		}
+		if p, ok := prios[t.Type]; ok {
+			c.Transports[i].Priority = p
 		}
 	}
 	return share.MakeLink(c)
