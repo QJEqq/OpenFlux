@@ -198,6 +198,7 @@ func authorizeWithJar(docURL string, jar http.CookieJar) (*volgaAuth, error) {
 	var finalBody []byte
 	var finalURL string
 	currentURL := docURL
+	refreshed := false // Passport's session refresh is followed once
 
 	for i := 0; i < 15; i++ {
 		req, _ := http.NewRequest("GET", currentURL, nil)
@@ -218,6 +219,10 @@ func authorizeWithJar(docURL string, jar http.CookieJar) (*volgaAuth, error) {
 		utils.Debugf("[VOLGA] GET %s -> %d (%d bytes)", currentURL, resp.StatusCode, len(body))
 
 		if resp.StatusCode == 200 {
+			// A Passport page that did not send us back: the login wall.
+			if strings.Contains(currentURL, "passport.yandex") {
+				return nil, &PromptError{URL: currentURL, Kind: ErrLoginRequired}
+			}
 			finalBody = body
 			finalURL = currentURL
 			break
@@ -238,6 +243,12 @@ func authorizeWithJar(docURL string, jar http.CookieJar) (*volgaAuth, error) {
 			}
 
 			if strings.Contains(loc, "passport.yandex") {
+				if isPassportRefresh(loc) && !refreshed {
+					refreshed = true
+					utils.Debugf("[VOLGA] Passport refreshes the sign-in, following")
+					currentURL = resolveLocation(currentURL, loc)
+					continue
+				}
 				return nil, &PromptError{URL: resolveLocation(currentURL, loc), Kind: ErrLoginRequired}
 			}
 

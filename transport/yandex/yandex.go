@@ -838,6 +838,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	currentURL := url
 	var resp *http.Response
 	var err error
+	refreshed := false // Passport's session refresh is followed once
 
 	for hop := 0; hop < 10; hop++ {
 		utils.Debugf("[YDOCS] hop %d: GET %s", hop, shortStr(currentURL, 120))
@@ -852,8 +853,13 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		utils.Debugf("[YDOCS]   status=%d location=%s",
 			resp.StatusCode, shortStr(resp.Header.Get("Location"), 120))
 
-		// 200 — дошли до документа
+		// 200 — дошли до документа. Страница Паспорта, не вернувшая назад, — стена входа.
 		if resp.StatusCode == 200 {
+			if strings.Contains(currentURL, "passport.yandex") {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				return YandexDocsInfo{}, ErrLoginRequired
+			}
 			break
 		}
 
@@ -887,8 +893,16 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 				continue
 			}
 
-			// Login page: not a captcha, not recoverable in-band.
+			// Passport's session refresh is followed once, like a browser
+			// (see isPassportRefresh). Anything else there is the login page:
+			// not a captcha, not recoverable in-band.
 			if strings.Contains(loc, "passport.yandex") {
+				if isPassportRefresh(loc) && !refreshed {
+					refreshed = true
+					utils.Debugf("[YDOCS] Passport refreshes the sign-in, following")
+					currentURL = resolveLocation(currentURL, loc)
+					continue
+				}
 				return YandexDocsInfo{}, ErrLoginRequired
 			}
 
