@@ -980,6 +980,30 @@ func (s *Session) LiveTransports() []string {
 	return names
 }
 
+// CarrierState is one carrier as the session sees it now.
+type CarrierState struct {
+	Name     string
+	Priority int
+	// Up: started, not given up on, and its transport says it is connected.
+	Up bool
+	// Heard is when the peer was last heard on it (zero: never).
+	Heard time.Time
+}
+
+// CarrierStates lists every carrier, highest priority first — for an exit's
+// stats file (which carrier is up, when the client was last heard on it).
+func (s *Session) CarrierStates() []CarrierState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]CarrierState, 0, len(s.order))
+	for _, name := range s.order {
+		if l := s.links[name]; l != nil {
+			out = append(out, CarrierState{Name: l.name, Priority: l.priority, Up: s.connectedLocked(l), Heard: l.lastHeard})
+		}
+	}
+	return out
+}
+
 func (s *Session) IsExit() bool { return s.exit }
 
 func (s *Session) PeerParameters() (PeerParameters, bool) {

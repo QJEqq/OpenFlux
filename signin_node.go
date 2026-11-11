@@ -16,7 +16,7 @@ import (
 // leave a sign-in in the inbox and send SIGHUP instead of overwriting
 // cookies.json and restarting; "signin-state": the node writes
 // signinStateFile for show.
-const coreFeatures = "cookie-inbox\nsignin-state\n"
+const coreFeatures = "cookie-inbox\nsignin-state\nexit-stats\n"
 
 // signinStateFile is written next to the cookie store.
 const signinStateFile = "signin-state"

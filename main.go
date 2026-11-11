@@ -1042,6 +1042,7 @@ DEPRECATED (removed in v2)
 			if isExit {
 				managerInst.SetRefusePeerLogin(*refusePeerLogin)
 				startExitSignInKeeper(managerInst, store)
+				startExitStatsWriter(managerInst, filepath.Join(filepath.Dir(store.Path()), exitStatsFile))
 			}
 		}
 
