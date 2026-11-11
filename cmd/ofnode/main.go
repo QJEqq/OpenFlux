@@ -21,6 +21,7 @@
 //	GET    /channels          {"ok","channels":[{"channel","port","mode","state","restarts","last_exit"}]}
 //	POST   /channels          {"channel","key","mode","transports":[{"type","url"}],"cookies","priorities"} -> {"ok","port"}
 //	DELETE /channels/{name}   {"ok"}
+//	GET    /channels/{name}/log  {"ok","lines"}: the channel core's last 200 output lines
 //	PUT    /core              body: the core, X-Core-SHA256: its sha256 -> {"ok","core","was","restarted"};
 //	                          every channel moves onto it (back to the old one if a channel does not come up)
 package main
@@ -89,6 +90,7 @@ func serve() error {
 		return err
 	}
 	a.restore()
+	go a.statsLoop()
 	_, core := a.coreNow()
 	from := map[string]string{"image": "из образа", "pushed": "от аугментера"}[a.coreFrom()]
 	log.Printf("[ofnode] %s: API :%d, каналов %d, ядро %.12s… (%s), порты direct %d-%d", agentVersion, port, len(a.chans), core, from, lo, hi)

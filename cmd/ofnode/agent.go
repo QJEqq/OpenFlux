@@ -22,18 +22,19 @@ import (
 	"time"
 )
 
-const agentVersion = "0.2.0"
+const agentVersion = "0.3.0"
 
 // agent keeps the node's channels: one supervised `openflux --config
 // node.conf` per channel, each in its own directory under dir, so a restarted
 // container brings them all back (restore).
 type agent struct {
-	mu    sync.Mutex
-	dir   string
-	lo    int
-	hi    int
-	grace time.Duration // how long a new channel's core must stay up to count as started
-	chans map[string]*channel
+	mu         sync.Mutex
+	dir        string
+	lo         int
+	hi         int
+	grace      time.Duration // how long a new channel's core must stay up to count as started
+	statsEvery time.Duration // how often statsLoop refreshes the channels' statistics
+	chans      map[string]*channel
 
 	// The core channels start on: the one the augmenter pushed (core.go) or,
 	// until it pushes one, the image's (imageBin, OPENFLUX_BIN).
@@ -60,7 +61,18 @@ type channel struct {
 	state    string // running, restarting, stopped
 	starts   int
 	lastExit string
-	tail     []string // the core's last output lines
+	tail     []string  // the core's last output lines
+	pid      int       // the running core (0: none)
+	since    time.Time // when it started
+
+	// statistics (stats.go), refreshed by the agent's statsLoop
+	snap     *chanStats
+	signin   []signIn
+	tot      *totals
+	cpu      float64
+	rss      uint64
+	cpuTicks uint64
+	cpuAt    time.Time
 }
 
 type channelMeta struct {
@@ -73,7 +85,7 @@ func newAgent(dir, bin string, lo, hi int) (*agent, error) {
 		return nil, err
 	}
 	a := &agent{
-		dir: dir, lo: lo, hi: hi, grace: 2 * time.Second, bin: bin, core: "?", imageBin: bin,
+		dir: dir, lo: lo, hi: hi, grace: 2 * time.Second, statsEvery: 15 * time.Second, bin: bin, core: "?", imageBin: bin,
 		chans: map[string]*channel{}, ipt: runIptables, localIP: outboundIP,
 	}
 	if sum, err := fileSHA256(bin); err == nil {
@@ -279,6 +291,14 @@ func (a *agent) runOnce(c *channel) error {
 		return err
 	}
 	w.Close()
+	c.mu.Lock()
+	c.pid, c.since = cmd.Process.Pid, time.Now()
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.pid = 0
+		c.mu.Unlock()
+	}()
 	pumped := make(chan struct{})
 	go func() { a.pump(c, r); close(pumped) }()
 	c.set("running", "")
@@ -314,8 +334,8 @@ func (a *agent) pump(c *channel, r io.ReadCloser) {
 		line := sc.Text()
 		c.mu.Lock()
 		c.tail = append(c.tail, line)
-		if len(c.tail) > 20 {
-			c.tail = c.tail[len(c.tail)-20:]
+		if len(c.tail) > tailLines {
+			c.tail = c.tail[len(c.tail)-tailLines:]
 		}
 		c.mu.Unlock()
 		log.Printf("[%s] %s", c.name, line)
@@ -332,18 +352,28 @@ func (c *channel) set(state, why string) {
 }
 
 type channelStatus struct {
-	Channel  string `json:"channel"`
-	Port     int    `json:"port"`
-	Mode     string `json:"mode"`
-	State    string `json:"state"`
-	Restarts int    `json:"restarts"`
-	LastExit string `json:"last_exit,omitempty"`
+	Channel  string     `json:"channel"`
+	Port     int        `json:"port"`
+	Mode     string     `json:"mode"`
+	State    string     `json:"state"`
+	Restarts int        `json:"restarts"`
+	LastExit string     `json:"last_exit,omitempty"`
+	Since    int64      `json:"since,omitempty"` // the running core started (unix)
+	CPU      float64    `json:"cpu"`             // % of one core
+	RSS      uint64     `json:"rss"`             // bytes
+	Stats    *chanStats `json:"stats,omitempty"`
+	SignIn   []signIn   `json:"signin,omitempty"`
 }
 
 func (c *channel) status() channelStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return channelStatus{Channel: c.name, Port: c.port, Mode: c.mode, State: c.state, Restarts: max(c.starts-1, 0), LastExit: c.lastExit}
+	st := channelStatus{Channel: c.name, Port: c.port, Mode: c.mode, State: c.state, Restarts: max(c.starts-1, 0), LastExit: c.lastExit,
+		CPU: c.cpu, RSS: c.rss, Stats: c.snap, SignIn: c.signin}
+	if c.pid > 0 {
+		st.Since = c.since.Unix()
+	}
+	return st
 }
 
 // waitUp waits a.grace for the new core to stay up; a core that exits at once
@@ -412,6 +442,7 @@ func (a *agent) routes(token string) http.Handler {
 	mux.HandleFunc("GET /channels", a.handleList)
 	mux.HandleFunc("POST /channels", a.handleApply)
 	mux.HandleFunc("DELETE /channels/{name}", a.handleRemove)
+	mux.HandleFunc("GET /channels/{name}/log", a.handleLog)
 	mux.HandleFunc("PUT /core", a.handleCore)
 	want := []byte("Bearer " + token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

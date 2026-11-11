@@ -163,6 +163,7 @@ func (a *agent) restartAll() (int, error) {
 		close(c.stop)
 		<-c.done
 		nc := newChannel(c.name, c.dir, c.port, c.mode)
+		nc.tail = c.tail // the channel log runs on across the core change
 		a.chans[c.name] = nc
 		go a.supervise(nc)
 		fresh[i] = nc
