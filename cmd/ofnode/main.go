@@ -12,14 +12,17 @@
 //	                  NODE_PORT     API port (default 2223)
 //	                  PORT_RANGE    ports for the channels' direct (default 20000-29999)
 //	                  DATA_DIR      channel state (default /var/lib/openflux-node)
-//	                  OPENFLUX_BIN  the core (default /usr/local/bin/openflux)
+//	                  OPENFLUX_BIN  the image's core (default /usr/local/bin/openflux);
+//	                                a core the augmenter pushed (PUT /core) wins
 //
 // API (HTTPS, Authorization: Bearer <token>):
 //
-//	GET    /health            {"ok","agent","core","arch","channels","port_range"}
+//	GET    /health            {"ok","agent","core","core_from","arch","channels","port_range"}
 //	GET    /channels          {"ok","channels":[{"channel","port","mode","state","restarts","last_exit"}]}
 //	POST   /channels          {"channel","key","mode","transports":[{"type","url"}],"cookies","priorities"} -> {"ok","port"}
 //	DELETE /channels/{name}   {"ok"}
+//	PUT    /core              body: the core, X-Core-SHA256: its sha256 -> {"ok","core","was","restarted"};
+//	                          every channel moves onto it (back to the old one if a channel does not come up)
 package main
 
 import (
@@ -86,7 +89,9 @@ func serve() error {
 		return err
 	}
 	a.restore()
-	log.Printf("[ofnode] %s: API :%d, каналов %d, ядро %.12s…, порты direct %d-%d", agentVersion, port, len(a.chans), a.core, lo, hi)
+	_, core := a.coreNow()
+	from := map[string]string{"image": "из образа", "pushed": "от аугментера"}[a.coreFrom()]
+	log.Printf("[ofnode] %s: API :%d, каналов %d, ядро %.12s… (%s), порты direct %d-%d", agentVersion, port, len(a.chans), core, from, lo, hi)
 
 	srv := &http.Server{
 		Addr:              ":" + strconv.Itoa(port),

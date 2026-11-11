@@ -2,10 +2,8 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +22,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.1.0"
+const agentVersion = "0.2.0"
 
 // agent keeps the node's channels: one supervised `openflux --config
 // node.conf` per channel, each in its own directory under dir, so a restarted
@@ -32,12 +30,18 @@ const agentVersion = "0.1.0"
 type agent struct {
 	mu    sync.Mutex
 	dir   string
-	bin   string
 	lo    int
 	hi    int
 	grace time.Duration // how long a new channel's core must stay up to count as started
-	core  string        // sha256 of the core binary (what /health reports)
 	chans map[string]*channel
+
+	// The core channels start on: the one the augmenter pushed (core.go) or,
+	// until it pushes one, the image's (imageBin, OPENFLUX_BIN).
+	coreMu   sync.RWMutex
+	bin      string
+	core     string // its sha256, what /health reports
+	imageBin string
+	pushMu   sync.Mutex // one core push at a time
 
 	// iptables and the node's outbound address; tests replace them.
 	ipt     func(args ...string) error
@@ -68,17 +72,17 @@ func newAgent(dir, bin string, lo, hi int) (*agent, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	sum := "?"
-	if f, err := os.Open(bin); err == nil {
-		h := sha256.New()
-		_, _ = io.Copy(h, f)
-		f.Close()
-		sum = hex.EncodeToString(h.Sum(nil))
-	}
-	return &agent{
-		dir: dir, bin: bin, lo: lo, hi: hi, grace: 2 * time.Second, core: sum,
+	a := &agent{
+		dir: dir, lo: lo, hi: hi, grace: 2 * time.Second, bin: bin, core: "?", imageBin: bin,
 		chans: map[string]*channel{}, ipt: runIptables, localIP: outboundIP,
-	}, nil
+	}
+	if sum, err := fileSHA256(bin); err == nil {
+		a.core = sum
+	}
+	if path, sum, ok := a.pushedCore(); ok {
+		a.bin, a.core = path, sum
+	}
+	return a, nil
 }
 
 func runIptables(args ...string) error { return exec.Command("iptables", args...).Run() }
@@ -262,7 +266,8 @@ func (a *agent) runOnce(c *channel) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(a.bin, "--config", filepath.Join(c.dir, "node.conf"))
+	bin, _ := a.coreNow()
+	cmd := exec.Command(bin, "--config", filepath.Join(c.dir, "node.conf"))
 	cmd.Dir = c.dir
 	cmd.Stdout, cmd.Stderr = w, w
 	c.mu.Lock()
@@ -407,6 +412,7 @@ func (a *agent) routes(token string) http.Handler {
 	mux.HandleFunc("GET /channels", a.handleList)
 	mux.HandleFunc("POST /channels", a.handleApply)
 	mux.HandleFunc("DELETE /channels/{name}", a.handleRemove)
+	mux.HandleFunc("PUT /core", a.handleCore)
 	want := []byte("Bearer " + token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
@@ -427,9 +433,10 @@ func (a *agent) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	a.mu.Lock()
 	n := len(a.chans)
 	a.mu.Unlock()
+	_, core := a.coreNow()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok": true, "agent": agentVersion, "core": a.core, "arch": runtime.GOARCH, "channels": n,
-		"port_range": fmt.Sprintf("%d-%d", a.lo, a.hi),
+		"ok": true, "agent": agentVersion, "core": core, "core_from": a.coreFrom(), "arch": runtime.GOARCH,
+		"channels": n, "port_range": fmt.Sprintf("%d-%d", a.lo, a.hi),
 	})
 }
 
