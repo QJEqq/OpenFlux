@@ -52,16 +52,26 @@ func testSpec() channelSpec {
 	}
 }
 
-// fakeIPT is iptables with the rules kept in a map.
+// fakeIPT is iptables with the rules kept in a map, by table.
 type fakeIPT struct {
 	mu    sync.Mutex
 	rules map[string]bool
+	noRaw bool // a kernel without the raw table
 }
+
+const rstRule = "OUTPUT -p tcp --tcp-flags RST RST -s 10.0.0.1 -j DROP"
 
 func (f *fakeIPT) run(args ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	key := strings.Join(args[1:], " ")
+	table := "filter"
+	if len(args) > 1 && args[0] == "-t" {
+		table, args = args[1], args[2:]
+	}
+	if table == "raw" && f.noRaw {
+		return errors.New("iptables: can't initialize iptables table `raw'")
+	}
+	key := table + " " + strings.Join(args[1:], " ")
 	switch args[0] {
 	case "-C":
 		if !f.rules[key] {
@@ -75,10 +85,13 @@ func (f *fakeIPT) run(args ...string) error {
 	return nil
 }
 
-func (f *fakeIPT) has() bool {
+// has: the RST rule is in place, in whichever table.
+func (f *fakeIPT) has() bool { return f.in("raw") || f.in("filter") }
+
+func (f *fakeIPT) in(table string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.rules["OUTPUT -p tcp --tcp-flags RST RST -s 10.0.0.1 -j DROP"]
+	return f.rules[table+" "+rstRule]
 }
 
 func newTestAgent(t *testing.T, core, dir string, ipt *fakeIPT) *agent {
@@ -346,8 +359,10 @@ func TestL3NeedsTheRSTRule(t *testing.T) {
 	ipt := &fakeIPT{rules: map[string]bool{}}
 	a := newTestAgent(t, "run", t.TempDir(), ipt)
 	a.ipt = func(args ...string) error {
-		if args[0] == "-A" {
-			return errors.New("iptables: Permission denied")
+		for _, a := range args {
+			if a == "-A" {
+				return errors.New("iptables: Permission denied")
+			}
 		}
 		return ipt.run(args...)
 	}

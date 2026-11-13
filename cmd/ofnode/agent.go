@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.3.0"
+const agentVersion = "0.3.1"
 
 // agent keeps the node's channels: one supervised `openflux --config
 // node.conf` per channel, each in its own directory under dir, so a restarted
@@ -419,16 +419,40 @@ func (a *agent) syncL3() error {
 		}
 		return nil
 	}
-	rule := []string{"OUTPUT", "-p", "tcp", "--tcp-flags", "RST", "RST", "-s", ip, "-j", "DROP"}
-	has := a.ipt(append([]string{"-C"}, rule...)...) == nil
-	switch {
-	case need && !has:
-		if err := a.ipt(append([]string{"-A"}, rule...)...); err != nil {
-			return fmt.Errorf("не удалось добавить правило RST: %w", err)
+	// The rule lives in the raw table, ahead of connection tracking. Dropped in
+	// filter, the kernel's RST is still seen by conntrack, which then calls the
+	// connection closed — and a firewall that drops INVALID packets (ufw does)
+	// throws away every reply that follows: the client connects, nothing loads.
+	// A kernel without the raw table gets it in filter, as older agents had it.
+	match := []string{"OUTPUT", "-p", "tcp", "--tcp-flags", "RST", "RST", "-s", ip, "-j", "DROP"}
+	rule := func(table, op string) []string { return append([]string{"-t", table, op}, match...) }
+	in := func(table string) bool { return a.ipt(rule(table, "-C")...) == nil }
+	inRaw, inFilter := in("raw"), in("filter")
+	if !need {
+		for table, has := range map[string]bool{"raw": inRaw, "filter": inFilter} {
+			if has {
+				if err := a.ipt(rule(table, "-D")...); err != nil {
+					log.Printf("[ofnode] l3: не удалось убрать правило RST (%s): %v", table, err)
+				}
+			}
 		}
-	case !need && has:
-		if err := a.ipt(append([]string{"-D"}, rule...)...); err != nil {
-			log.Printf("[ofnode] l3: не удалось убрать правило RST: %v", err)
+		return nil
+	}
+	if !inRaw {
+		if err := a.ipt(rule("raw", "-A")...); err != nil {
+			if inFilter {
+				return nil // kernel without raw: the filter one stays
+			}
+			if ferr := a.ipt(rule("filter", "-A")...); ferr != nil {
+				return fmt.Errorf("не удалось добавить правило RST: %w", ferr)
+			}
+			log.Printf("[ofnode] l3: таблицы raw нет (%v) — правило RST в filter; с файрволом, режущим INVALID (ufw), l3 может не работать", err)
+			return nil
+		}
+	}
+	if inFilter { // left by an older agent or l3-rst.sh: the raw one does it right
+		if err := a.ipt(rule("filter", "-D")...); err != nil {
+			log.Printf("[ofnode] l3: не удалось убрать старое правило RST из filter: %v", err)
 		}
 	}
 	return nil
