@@ -57,6 +57,24 @@ type AvitoConfig struct {
 	RoomCreatePause time.Duration
 
 	StatsInterval time.Duration
+
+	// PingInterval is how often a room's socket is pinged. Avito's front
+	// closes a WebSocket that carries nothing for 60 s (1006; measured
+	// 59.8-60.4 s on every room, 2026-11-17), and each new handshake is
+	// scarce (10 a minute per address): an exit with no client, or a lane
+	// with nothing to send, lost its rooms every minute and spent its budget
+	// on reconnects. A pong answers each ping and keeps the socket open
+	// (measured: 150 s and counting). 0 sends none.
+	PingInterval time.Duration
+
+	// RoomRest is how long a room waits after Avito refuses its ops with
+	// ERR_ROOM_OPERATION_LIMIT before it tries again, doubling up to
+	// RoomRestMax. Live (2026-11-17) the exit's rooms hit it under a
+	// download at doc versions from 44 to 224 - a budget of the room's over
+	// some window, not for life - and refused every op after it; retried at
+	// the usual pace, each try spent a handshake of the address's ten a
+	// minute that the other rooms needed.
+	RoomRest, RoomRestMax time.Duration
 }
 
 // envKB reads a positive integer knob (the name is historic: chunk sizes
@@ -78,7 +96,11 @@ func DefaultAvitoConfig() AvitoConfig {
 		ReconnectMultiplier: 1.3,
 		HTTPTimeout:         30 * time.Second,
 
-		ChunkBytes:    envKB("AVITO_CHUNK_KB", 256) * 1024,
+		// 128 KB: the largest op Avito takes now is between 128 KB (175 KB
+		// of base64: accepted) and 256 KB (350 KB: the socket is closed
+		// with 1009 "message too big"), measured 2026-11-17; the old 256 KB
+		// closed the socket on every full op.
+		ChunkBytes:    envKB("AVITO_CHUNK_KB", 128) * 1024,
 		SendQueueSize: 256,
 
 		ReadBufferSize:  256 << 10,
@@ -89,6 +111,9 @@ func DefaultAvitoConfig() AvitoConfig {
 		RoomCreatePause: 300 * time.Millisecond,
 
 		StatsInterval: 5 * time.Second,
+		PingInterval:  20 * time.Second,
+		RoomRest:      2 * time.Minute,
+		RoomRestMax:   30 * time.Minute,
 	}
 }
 
@@ -97,6 +122,9 @@ var (
 	errRefused  = errors.New("refused")
 	errNoRoom   = errors.New("avito: нет подключённой комнаты")
 	errStopped  = errors.New("avito: транспорт остановлен")
+	// errRoomResting: Avito takes no more ops in this room for now
+	// (ERR_ROOM_OPERATION_LIMIT); the room rests, see AvitoConfig.RoomRest.
+	errRoomResting = errors.New("avito: room operation limit")
 )
 
 func createRoom(ctx context.Context, cookies string) (string, error) {
@@ -173,9 +201,13 @@ type avitoWS struct {
 
 	// gate paces the transport's dials: all rooms share it.
 	gate *dialGate
+	// ops is the transport's op pacing, shared by its rooms.
+	ops *transport.RateBrake
 
 	// needJoin is set when Avito says the room was never joined (see registerRoom).
 	needJoin bool
+	// rest is the room's next rest after ERR_ROOM_OPERATION_LIMIT (run only).
+	rest time.Duration
 
 	connected atomic.Bool
 	onData    func([]byte)
@@ -202,6 +234,9 @@ type channelStats struct {
 }
 
 func (w *avitoWS) dial() (*websocket.Conn, error) {
+	if w.gate != nil && !w.gate.wait(w.ctx) {
+		return nil, errStopped
+	}
 	wsURL := strings.Replace(baseURL, "https://", "wss://", 1) + "/sharedb"
 	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
 
@@ -215,9 +250,6 @@ func (w *avitoWS) dial() (*websocket.Conn, error) {
 		HandshakeTimeout: w.config.WSHandshakeTimeout,
 		ReadBufferSize:   w.config.ReadBufferSize,
 		WriteBufferSize:  w.config.WriteBufferSize,
-	}
-	if w.gate != nil && !w.gate.wait(w.ctx) {
-		return nil, errStopped
 	}
 	conn, resp, err := dialer.DialContext(w.ctx, wsURL, header)
 	if err != nil {
@@ -337,8 +369,23 @@ func (w *avitoWS) run() {
 		if time.Since(up) > 30*time.Second {
 			delay = w.config.ReconnectMinDelay
 		}
+		if time.Since(up) > w.config.RoomRestMax {
+			w.rest = 0 // it worked for long: the next rest starts short again
+		}
 		utils.Debugf("[AVITO] ws error (%s): %v", w.roomID[:8], err)
 		w.stats.reconnects.Add(1)
+		if errors.Is(err, errRoomResting) {
+			rest := w.rest
+			if rest == 0 {
+				rest = w.config.RoomRest
+			}
+			w.rest = min(2*rest, w.config.RoomRestMax)
+			utils.Debugf("[AVITO] room %s rests %v: Avito takes no more ops in it for now", w.roomID[:8], rest)
+			if !sleepCtx(w.ctx, rest) {
+				return
+			}
+			continue
+		}
 		if w.needJoin {
 			w.needJoin = false
 			if jerr := registerRoom(w.ctx, w.roomID); jerr != nil {
@@ -385,7 +432,16 @@ func (w *avitoWS) connectAndServe() error {
 	// loops belong to this socket: done ends them with it, and the send loop
 	// is waited for, so a loop from a dead socket never takes the next one's
 	// acks or writes into it with a stale version.
-	c := &avitoConn{done: make(chan struct{}), ack: make(chan map[string]interface{}, 64)}
+	cctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+	c := &avitoConn{done: make(chan struct{}), ack: make(chan map[string]interface{}, 64), ctx: cctx}
+	// Pings keep the socket from going idle (see PingInterval); a pong is
+	// life on the socket, so it also moves the read deadline, or a room with
+	// nothing to read would still time out. Set before the reader starts:
+	// the reader is what calls it.
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
+	})
 	readDone := make(chan error, 1)
 	go func() {
 		readDone <- w.readLoop(conn, c)
@@ -395,6 +451,10 @@ func (w *avitoWS) connectAndServe() error {
 	go func() {
 		sendDone <- w.sendLoop(c)
 	}()
+
+	if w.config.PingInterval > 0 {
+		go w.pingLoop(conn, c)
+	}
 
 	readEnded, sendEnded := false, false
 	select {
@@ -406,6 +466,7 @@ func (w *avitoWS) connectAndServe() error {
 		err = errStopped
 	}
 	close(c.done)
+	cancel() // a send loop waiting on the op pacing lets go too
 	w.connected.Store(false)
 	conn.Close()
 	if !sendEnded {
@@ -425,6 +486,8 @@ func (w *avitoWS) connectAndServe() error {
 type avitoConn struct {
 	done chan struct{}
 	ack  chan map[string]interface{}
+	// ctx ends with the socket, for what waits on the op pacing.
+	ctx context.Context
 }
 
 // readLoop is the sole reader on the WebSocket. It routes ack replies to
@@ -522,18 +585,42 @@ func (w *avitoWS) sendOp(c *avitoConn, data []byte) error {
 		op = []interface{}{encoded}
 	}
 
-	if err := w.writeJSON(map[string]interface{}{
-		"a": "op", "c": "docs", "d": w.roomID,
-		"v": w.ver, "src": w.connID, "seq": w.seq, "op": op,
-	}); err != nil {
-		return err
-	}
+	for {
+		if w.ops != nil && !w.ops.Wait(c.ctx) {
+			return errStopped
+		}
+		if err := w.writeJSON(map[string]interface{}{
+			"a": "op", "c": "docs", "d": w.roomID,
+			"v": w.ver, "src": w.connID, "seq": w.seq, "op": op,
+		}); err != nil {
+			return err
+		}
 
-	// Wait for the ack from readLoop.
-	select {
-	case reply := <-c.ack:
+		// Wait for the ack from readLoop.
+		var reply map[string]interface{}
+		select {
+		case reply = <-c.ack:
+		case <-c.done:
+			return errStopped
+		case <-w.ctx.Done():
+			return errStopped
+		}
 		if errMsg := reply["error"]; errMsg != nil {
 			w.stats.errors.Add(1)
+			// Too many ops from this address: the op was not applied, so it
+			// goes again, the same version and seq, once the pause every room
+			// keeps is over. Treated as fatal it closed the socket, and the
+			// reconnect spent a handshake from the 10-a-minute budget (live,
+			// three rooms at once, 2026-11-17).
+			if w.ops != nil && isActionRateLimited(errMsg) {
+				if rate, cut := w.ops.Hit(time.Now()); cut && utils.Throttled("avito.ops", time.Minute) {
+					utils.Infof("[AVITO] Avito limits this address's ops (ERR_ACTION_RATE_LIMITED): pacing every room to %.0f ops a second", rate)
+				}
+				continue
+			}
+			if isRoomOpLimit(errMsg) {
+				return fmt.Errorf("%w: %v", errRoomResting, errMsg)
+			}
 			return fmt.Errorf("op error: %v", errMsg)
 		}
 		if v, ok := reply["v"].(float64); ok {
@@ -541,10 +628,7 @@ func (w *avitoWS) sendOp(c *avitoConn, data []byte) error {
 		} else {
 			w.ver++
 		}
-	case <-c.done:
-		return errStopped
-	case <-w.ctx.Done():
-		return errStopped
+		break
 	}
 
 	w.seq++
@@ -567,6 +651,11 @@ func (w *avitoWS) Send(data []byte) error {
 
 type AvitoTransport struct {
 	*transport.BaseTransport
+
+	// ops paces every room's ops once Avito refuses one as too many
+	// (ERR_ACTION_RATE_LIMITED): the limit is the address's, live three rooms
+	// were refused at once (2026-11-17). See transport.RateBrake.
+	ops transport.RateBrake
 
 	cookies  string
 	roomIDs  []string
@@ -685,6 +774,7 @@ func (t *AvitoTransport) Start() error {
 				framed:    t.striped,
 				wake:      make(chan struct{}, 1),
 				gate:      t.gate,
+				ops:       &t.ops,
 			}
 			ws.onData = onData
 			wss[i] = ws
@@ -702,11 +792,26 @@ func (t *AvitoTransport) Start() error {
 		}
 	}
 
-	for _, ws := range t.txWss {
-		go ws.run()
-	}
-	for _, ws := range t.rxWss {
-		go ws.run()
+	// Rooms come up a few at once, then one per refill of the address's
+	// budget (dialGate). Started send and receive room in turn, each a
+	// little after the last so that they ask the gate in that order, the
+	// first dials make whole lanes. All the send rooms first left a cold
+	// client with four of them and nothing to hear the exit on for about a
+	// minute (live, 2026-11-17): past a session's 20 s handshake.
+	k := 0
+	for i := 0; i < max(len(t.txWss), len(t.rxWss)); i++ {
+		for _, wss := range [][]*avitoWS{t.txWss, t.rxWss} {
+			if i >= len(wss) {
+				continue
+			}
+			ws, delay := wss[i], time.Duration(k)*roomStartStagger
+			k++
+			go func() {
+				if sleepCtx(ws.ctx, delay) {
+					ws.run()
+				}
+			}()
+		}
 	}
 
 	utils.Debugf("[AVITO] transport started: %d tx + %d rx rooms, striped=%v", len(t.txWss), len(t.rxWss), t.striped)
@@ -1009,3 +1114,46 @@ func (t *AvitoTransport) SetNumRooms(n int) {
 
 // StripeOptions are the settings for a stripe over this carrier's rooms.
 func StripeOptions() transport.StripeOptions { return stripeOptions }
+
+// pingLoop pings the socket every PingInterval until it ends.
+func (w *avitoWS) pingLoop(conn *websocket.Conn, c *avitoConn) {
+	tick := time.NewTicker(w.config.PingInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-tick.C:
+			// WriteControl may run alongside the socket's other writes.
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(w.config.WSWriteTimeout)); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// roomStartStagger spaces the rooms' starts, so that they reach the dial
+// gate in the order Start means (see Start).
+const roomStartStagger = 5 * time.Millisecond
+
+// isActionRateLimited reports Avito's ERR_ACTION_RATE_LIMITED ("ShareDB action
+// rate limited").
+func isActionRateLimited(errMsg interface{}) bool {
+	m, ok := errMsg.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	code, _ := m["code"].(string)
+	return code == "ERR_ACTION_RATE_LIMITED"
+}
+
+// isRoomOpLimit reports Avito's ERR_ROOM_OPERATION_LIMIT ("Room operation
+// limit exceeded").
+func isRoomOpLimit(errMsg interface{}) bool {
+	m, ok := errMsg.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	code, _ := m["code"].(string)
+	return code == "ERR_ROOM_OPERATION_LIMIT"
+}

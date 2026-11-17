@@ -46,6 +46,35 @@ type fakeCups struct {
 	// relaying it, as the real server does to a room sending near its limit.
 	dropEvery int
 	relayed   int
+	// limitRate > 0 is the address's budget of RPCs a second (limitBurst at
+	// once), as cups.online keeps one for all of an address's rooms; an RPC
+	// over it is refused with 429 and not relayed.
+	limitRate, limitBurst float64
+	limitTokens           float64
+	limitLast             time.Time
+	refused               int
+}
+
+// overLimit spends one RPC from the address's budget; true when there is none.
+func (f *fakeCups) overLimit() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.limitRate <= 0 {
+		return false
+	}
+	now := time.Now()
+	if f.limitLast.IsZero() {
+		f.limitTokens = f.limitBurst
+	} else {
+		f.limitTokens = min(f.limitBurst, f.limitTokens+now.Sub(f.limitLast).Seconds()*f.limitRate)
+	}
+	f.limitLast = now
+	if f.limitTokens < 1 {
+		f.refused++
+		return true
+	}
+	f.limitTokens--
+	return false
 }
 
 type fakeConn struct {
@@ -230,6 +259,10 @@ func (f *fakeCups) centrifugo(w http.ResponseWriter, r *http.Request) {
 			}
 			c.send(fmt.Sprintf(`{"id":%d,"subscribe":{}}`, cmd.ID))
 		case cmd.RPC != nil:
+			if cmd.RPC.Method == "shared_editor_change_cursors" && f.overLimit() {
+				c.send(fmt.Sprintf(`{"id":%d,"error":{"code":429,"message":"Превышено допустимое число отправок запроса."}}`, cmd.ID))
+				continue
+			}
 			c.send(fmt.Sprintf(`{"id":%d,"rpc":{}}`, cmd.ID))
 			if d := cmd.RPC.Data; cmd.RPC.Method == "shared_editor_change_cursors" && len(d.Cursors) > 0 {
 				// Model the real server: a non-numeric row/column is rejected,

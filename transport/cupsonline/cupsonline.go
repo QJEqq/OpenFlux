@@ -112,6 +112,10 @@ type CupsonlineConfig struct {
 	RoomCreatePause time.Duration
 
 	StatsInterval time.Duration
+
+	// RateBrake paces all of the transport's rooms after cups.online refuses
+	// a message with 429 (see sendBrake). On by default.
+	RateBrake bool
 	// Network the rooms' sockets dial through (TransportConfig.Network).
 	Network string
 }
@@ -167,6 +171,7 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 		RoomCreatePause: 500 * time.Millisecond,
 
 		StatsInterval: 5 * time.Second,
+		RateBrake:     true,
 	}
 }
 
@@ -573,6 +578,9 @@ type cupsWS struct {
 	idx      int
 	roomUUID string
 	joinedAt time.Time
+
+	// brake is the transport's, shared by all its rooms (see roomBrake).
+	brake *transport.RateBrake
 
 	// authPtr is swapped on every re-join (fresh tokens), so it's atomic. It
 	// stays nil until the room has been entered at least once.
@@ -1057,6 +1065,11 @@ func (w *cupsWS) pullLoop(src func(max int) [][]byte) {
 			idle.Stop()
 			continue
 		}
+		// The address's budget, shared by the transport's rooms: after a 429
+		// every room waits its turn (see sendBrake).
+		if w.brake != nil && !w.brake.Wait(w.ctx) {
+			return
+		}
 		w.lastSend = time.Now()
 		id := w.nextID()
 		w.dataIDs.Store(id, struct{}{})
@@ -1241,6 +1254,11 @@ func (w *cupsWS) handleReply(raw []byte) {
 		}
 	}
 	if e, ok := obj["error"]; ok {
+		if w.brake != nil && isRateLimited(e) {
+			if rate, cut := w.brake.Hit(time.Now()); cut && utils.Throttled("cups.brake", time.Minute) {
+				utils.Infof("[CUPS] cups.online limits this address (429): pacing every room to %.0f messages a second", rate)
+			}
+		}
 		// A message of ours the server would not take (it never reached the
 		// peer): the stripe resends its pieces; worth seeing when it happens.
 		if n := w.stats.rpcErrors.Add(1); n == 1 || n%100 == 0 {
@@ -1406,6 +1424,10 @@ func (w *cupsWS) Send(data []byte) error {
 type CupsonlineTransport struct {
 	*transport.BaseTransport
 
+	// brake paces every room's messages once cups.online refuses one.
+	brake     *transport.RateBrake
+	brakeOnce sync.Once
+
 	baseURL string
 	// roomIDs are the rooms to join, from --url. Empty on an exit node
 	// means "create new ones"; a client can't start without them.
@@ -1523,6 +1545,7 @@ func (t *CupsonlineTransport) Start() error {
 			wake:        make(chan struct{}, 1),
 			window:      t.config.SendWindow,
 			framed:      t.striped,
+			brake:       t.roomBrake(),
 			stats:       &channelStats{idx: i, roomUUID: s.id},
 		}
 		// Command ids 1 and 2 are connect and subscribe.
@@ -1936,3 +1959,27 @@ func (t *CupsonlineTransport) SetNumRooms(n int) {
 
 // StripeOptions are the settings for a stripe over this carrier's rooms.
 func StripeOptions() transport.StripeOptions { return stripeOptions }
+
+// isRateLimited reports a cups.online refusal for sending too often:
+// {"code":429,"message":"Превышено допустимое число отправок запроса."}.
+func isRateLimited(e interface{}) bool {
+	m, ok := e.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	code, _ := m["code"].(float64)
+	return code == 429
+}
+
+// roomBrake is the brake the transport's rooms share, nil with RateBrake off.
+// cups.online refuses an address's messages over its budget with 429, for
+// all of its rooms at once (live, 2026-11-17: after ~940 messages in ~35 s,
+// then ~13-15 a second in bursts); unpaced, 38 % of the messages sent were
+// retransmissions of refused ones. See transport.RateBrake.
+func (t *CupsonlineTransport) roomBrake() *transport.RateBrake {
+	if !t.config.RateBrake {
+		return nil
+	}
+	t.brakeOnce.Do(func() { t.brake = &transport.RateBrake{} })
+	return t.brake
+}

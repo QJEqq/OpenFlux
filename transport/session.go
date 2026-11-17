@@ -42,6 +42,7 @@ type Session struct {
 	candidate     *candidatePeer
 	candidateLast time.Time
 	nudgeLast     time.Time // the last hello an exit sent to a peer that spoke out of turn
+	helloAnswered time.Time // the last time a peer's hello was answered, see receiveHello
 
 	links map[string]*transportLink
 	order []string
@@ -114,6 +115,10 @@ type candidatePeer struct {
 const (
 	candidateTTL      = 20 * time.Second
 	candidateInterval = time.Second
+
+	// helloAnswerEvery bounds how often a hello that shows ours was not
+	// heard is answered again (the client sends one every 250 ms at first).
+	helloAnswerEvery = time.Second
 )
 
 type transportLink struct {
@@ -1438,8 +1443,14 @@ func (s *Session) receiveHello(link *transportLink, env *control.Envelope) {
 	}
 	link.lastHeard = time.Now()
 	var names []string
-	if changed || (!wasReady && echo) || (wasReady && env.Hello.Ready == 0) {
+	// A peer that keeps sending the zero echo has not heard our hello: the
+	// answer went where it was not listening (a striped carrier whose lanes
+	// are still coming up, live: Avito, where the exit's lanes were up and
+	// two of the client's eight), and nothing else would ever send it again.
+	again := !changed && !wasReady && zero && time.Since(s.helloAnswered) >= helloAnswerEvery
+	if changed || (!wasReady && echo) || (wasReady && env.Hello.Ready == 0) || again {
 		names = append(names, s.order...)
+		s.helloAnswered = time.Now()
 	}
 	peer := s.peer
 	s.mu.Unlock()

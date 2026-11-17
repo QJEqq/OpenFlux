@@ -64,23 +64,12 @@ func (t *AvitoTransport) startStripe() error {
 // last op acked) it takes pieces from the stripe up to ChunkBytes and sends
 // them as one op. What the room cannot take yet waits in the stripe's queue.
 func (w *avitoWS) pullLoop(c *avitoConn, src func(max int) [][]byte) error {
-	var hdr [4]byte
 	idle := time.NewTimer(time.Hour)
 	defer idle.Stop()
 	var blob []byte
+	var carry [][]byte // pieces taken that did not fit the last op
 	for {
-		blob = blob[:0]
-		for len(blob) < w.config.ChunkBytes {
-			pieces := src(1)
-			if len(pieces) == 0 {
-				break
-			}
-			for _, p := range pieces {
-				binary.BigEndian.PutUint32(hdr[:], uint32(len(p)))
-				blob = append(blob, hdr[:]...)
-				blob = append(blob, p...)
-			}
-		}
+		blob, carry = fillOp(blob[:0], carry, src, w.config.ChunkBytes)
 		if len(blob) == 0 {
 			idle.Reset(lanePollIdle)
 			select {
@@ -98,6 +87,33 @@ func (w *avitoWS) pullLoop(c *avitoConn, src func(max int) [][]byte) error {
 			return err
 		}
 	}
+}
+
+// fillOp frames pieces into blob - first those carried over from the last
+// op, then from src - up to max bytes, and returns it with what did not fit.
+// max is a hard limit: Avito closes the socket on an op over its size (1009),
+// so a piece that would go over waits for the next op; a piece bigger than
+// max goes alone.
+func fillOp(blob []byte, carry [][]byte, src func(max int) [][]byte, max int) ([]byte, [][]byte) {
+	var hdr [4]byte
+	for len(blob) < max {
+		pieces := carry
+		carry = nil
+		if len(pieces) == 0 {
+			if pieces = src(1); len(pieces) == 0 {
+				break
+			}
+		}
+		for i, p := range pieces {
+			if len(blob) > 0 && len(blob)+4+len(p) > max {
+				return blob, pieces[i:]
+			}
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(p)))
+			blob = append(blob, hdr[:]...)
+			blob = append(blob, p...)
+		}
+	}
+	return blob, carry
 }
 
 // splitFramed hands each piece of an op's blob to f. The pieces are slices of
