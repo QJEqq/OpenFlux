@@ -12,6 +12,7 @@ type startCountingWire struct {
 	negotiationWire
 	starts   atomic.Int32
 	failures atomic.Int32
+	blocked  atomic.Bool // SendBlocked, see session_blocked_test.go
 }
 
 func (w *startCountingWire) Start() error {

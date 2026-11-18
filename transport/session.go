@@ -1158,7 +1158,24 @@ func (s *Session) send(p []byte, raw []byte) error {
 	return chosen.batched.SendOwned(raw)
 }
 
+// SendBlocker is a carrier that can tell, while the peer is still heard on it,
+// that it cannot send for now: the service it rides on refuses this side's
+// messages. Live, cups.online refuses every request of an address for ~20 s
+// once the address is over its budget; the exit, still hearing the phone over
+// the rooms, kept routing into them and the tunnel stood still that long. The
+// session routes over another heard carrier meanwhile.
+type SendBlocker interface {
+	SendBlocked() bool
+}
+
+func sendBlocked(l *transportLink) bool {
+	b, ok := l.raw.(SendBlocker)
+	return ok && b.SendBlocked()
+}
+
 // liveLinksLocked returns the carriers to route through, in priority order.
+// A heard carrier that cannot send for now (SendBlocker) steps aside while
+// another heard one can.
 //
 // Carriers the peer has been heard on come first; a carrier that is merely
 // connected on this side may be stuck on the other (a document attached
@@ -1177,13 +1194,21 @@ func (s *Session) liveLinksLocked() []*transportLink {
 		return nil
 	}
 	out := make([]*transportLink, 0, len(s.links))
+	var blocked []*transportLink
 	for _, name := range s.order {
 		if l := s.links[name]; s.heardLocked(l) {
+			if sendBlocked(l) {
+				blocked = append(blocked, l)
+				continue
+			}
 			out = append(out, l)
 		}
 	}
 	if len(out) > 0 {
 		return out
+	}
+	if len(blocked) > 0 {
+		return blocked // nothing else is heard: the blocked one may yet take something
 	}
 	for _, name := range s.order {
 		if l := s.links[name]; s.connectedLocked(l) {

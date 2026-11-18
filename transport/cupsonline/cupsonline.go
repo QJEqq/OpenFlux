@@ -13,6 +13,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -116,6 +117,34 @@ type CupsonlineConfig struct {
 	// RateBrake paces all of the transport's rooms after cups.online refuses
 	// a message with 429 (see sendBrake). On by default.
 	RateBrake bool
+
+	// AddrRate and AddrBurst keep cups.online's budget for the address ahead
+	// of time, for every room of every core on this host (they share the
+	// AddressGate in AddrGateFile). Live (2026-11-18) the address had two
+	// windows, any request over either refused (429) for ~20 s, the refused
+	// ones not counted:
+	//   - ~2500 requests in about two minutes: at 25 a second, 100 s went
+	//     through, then everything was refused for 20 s, then it went again
+	//     (full 12 KB messages at 8 a second, 45 MB, went through: it is the
+	//     count, not the bytes);
+	//   - ~800 in 30 s: a burst of 300 at ~44 a second, then 18 a second, was
+	//     refused 20 s after the burst, ~830 requests into the last 30 s, twice.
+	// A tunnel sending 30-50 a second spent the budget in about a minute and
+	// its carrier was dead until the window came back, over and over; the
+	// brake, which waits for refusals, could not stop that. Tunnels of 8 rooms
+	// a side were refused at ~900-1000 requests even at 16-18 a second, where
+	// one room took 2500: the rule is not all known. Live on one address for
+	// both ends (10 MB down): 18 a second with a burst of 300 69.7 KB/s and 2
+	// refusals, burst 30 44.6 KB/s and 3, 16/100 52.5 KB/s, 12/12 none but the
+	// stripe starved (22.5 KB/s: a message waits its turn, the lanes resend
+	// what they think lost). So the gate keeps 18 a second, the node's cores
+	// together, and a refusal moves the session off the rooms until they take
+	// messages again (see SendBlocked). AddrRate 0 turns the gate off. CUPS_ADDR_RATE, CUPS_ADDR_BURST and
+	// OPENFLUX_CUPS_GATE_FILE ("off": this process only) override them.
+	AddrRate     float64
+	AddrBurst    int
+	AddrGateFile string
+
 	// Network the rooms' sockets dial through (TransportConfig.Network).
 	Network string
 }
@@ -172,6 +201,23 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 
 		StatsInterval: 5 * time.Second,
 		RateBrake:     true,
+
+		AddrRate:     18,
+		AddrBurst:    300,
+		AddrGateFile: cupsGateFile(),
+	}
+}
+
+// cupsGateFile is the AddressGate's file: OPENFLUX_CUPS_GATE_FILE, "off" for
+// none, else a file in the temp directory (the cores of a node share it).
+func cupsGateFile() string {
+	switch v := os.Getenv("OPENFLUX_CUPS_GATE_FILE"); v {
+	case "off":
+		return ""
+	case "":
+		return filepath.Join(os.TempDir(), "openflux-cups-gate")
+	default:
+		return v
 	}
 }
 
@@ -581,6 +627,11 @@ type cupsWS struct {
 
 	// brake is the transport's, shared by all its rooms (see roomBrake).
 	brake *transport.RateBrake
+	// gate is the address's budget, shared with every room of every core of
+	// the host (see CupsonlineConfig.AddrRate).
+	gate *transport.AddressGate
+	// refusedAt and takenAt are the transport's (see SendBlocked).
+	refusedAt, takenAt *atomic.Int64
 
 	// authPtr is swapped on every re-join (fresh tokens), so it's atomic. It
 	// stays nil until the room has been entered at least once.
@@ -1065,8 +1116,11 @@ func (w *cupsWS) pullLoop(src func(max int) [][]byte) {
 			idle.Stop()
 			continue
 		}
-		// The address's budget, shared by the transport's rooms: after a 429
-		// every room waits its turn (see sendBrake).
+		// The address's budget, kept ahead of time by every room of the host
+		// (see CupsonlineConfig.AddrRate), and after a 429 anyway the brake.
+		if d := w.gate.Reserve(time.Now()); d > 0 && !sleepCtx(w.ctx, d) {
+			return
+		}
 		if w.brake != nil && !w.brake.Wait(w.ctx) {
 			return
 		}
@@ -1242,8 +1296,10 @@ func (w *cupsWS) handleReply(raw []byte) {
 	// A reply to one of our cursor RPCs (ok or error) frees a slot in the
 	// ack gate and wakes the puller. Keepalive and handshake replies carry
 	// ids too but are not in dataIDs, so they're left alone.
+	ours := false // a reply to one of our data messages
 	if idf, ok := obj["id"].(float64); ok {
 		if _, had := w.dataIDs.LoadAndDelete(int64(idf)); had {
+			ours = true
 			if w.inflight.Add(-1) < 0 {
 				w.inflight.Store(0)
 			}
@@ -1253,7 +1309,15 @@ func (w *cupsWS) handleReply(raw []byte) {
 			}
 		}
 	}
-	if e, ok := obj["error"]; ok {
+	e, refused := obj["error"]
+	if ours && w.refusedAt != nil {
+		if refused && isRateLimited(e) {
+			w.refusedAt.Store(time.Now().UnixNano())
+		} else if !refused {
+			w.takenAt.Store(time.Now().UnixNano())
+		}
+	}
+	if refused {
 		if w.brake != nil && isRateLimited(e) {
 			if rate, cut := w.brake.Hit(time.Now()); cut && utils.Throttled("cups.brake", time.Minute) {
 				utils.Infof("[CUPS] cups.online limits this address (429): pacing every room to %.0f messages a second", rate)
@@ -1427,6 +1491,14 @@ type CupsonlineTransport struct {
 	// brake paces every room's messages once cups.online refuses one.
 	brake     *transport.RateBrake
 	brakeOnce sync.Once
+	// gate keeps the address's budget ahead of time (see addressGate).
+	gate     *transport.AddressGate
+	gateOnce sync.Once
+	// refusedAt and takenAt are when cups.online last refused one of our
+	// messages for the address's limit and last took one (UnixNano), for
+	// SendBlocked.
+	refusedAt atomic.Int64
+	takenAt   atomic.Int64
 
 	baseURL string
 	// roomIDs are the rooms to join, from --url. Empty on an exit node
@@ -1488,6 +1560,14 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
 			t.config.SendWindow = n
 		}
 	}
+	if s := os.Getenv("CUPS_ADDR_RATE"); s != "" {
+		if r, err := strconv.ParseFloat(s, 64); err == nil && r >= 0 {
+			t.config.AddrRate = r
+		}
+	}
+	if n := envInt("CUPS_ADDR_BURST"); n > 0 {
+		t.config.AddrBurst = n
+	}
 	// CUPS_ROOMS sets how many rooms a fresh exit creates (= stripe lanes).
 	// Each room relays ~130-200 KB/s, so throughput scales with rooms; the
 	// client follows whatever list the exit prints.
@@ -1546,6 +1626,9 @@ func (t *CupsonlineTransport) Start() error {
 			window:      t.config.SendWindow,
 			framed:      t.striped,
 			brake:       t.roomBrake(),
+			gate:        t.addressGate(),
+			refusedAt:   &t.refusedAt,
+			takenAt:     &t.takenAt,
 			stats:       &channelStats{idx: i, roomUUID: s.id},
 		}
 		// Command ids 1 and 2 are connect and subscribe.
@@ -1982,4 +2065,34 @@ func (t *CupsonlineTransport) roomBrake() *transport.RateBrake {
 	}
 	t.brakeOnce.Do(func() { t.brake = &transport.RateBrake{} })
 	return t.brake
+}
+
+// cupsBlockFor bounds SendBlocked after a refusal: live, cups.online refused
+// all of an address's requests for ~20 s at a time.
+const cupsBlockFor = 25 * time.Second
+
+// SendBlocked implements transport.SendBlocker: cups.online has refused one of
+// our messages for the address's limit and taken none since (for at most
+// cupsBlockFor). The peer is still heard on the rooms meanwhile, so without
+// this the session kept routing everything into refusals.
+func (t *CupsonlineTransport) SendBlocked() bool {
+	refused := t.refusedAt.Load()
+	return refused > t.takenAt.Load() && time.Since(time.Unix(0, refused)) < cupsBlockFor
+}
+
+// addressGate is the address's budget the transport's rooms take their turns
+// from, shared with the host's other cores through its file; nil with AddrRate
+// 0. See CupsonlineConfig.AddrRate.
+func (t *CupsonlineTransport) addressGate() *transport.AddressGate {
+	if t.config.AddrRate <= 0 {
+		return nil
+	}
+	t.gateOnce.Do(func() {
+		t.gate = &transport.AddressGate{
+			Interval: time.Duration(float64(time.Second) / t.config.AddrRate),
+			Burst:    max(t.config.AddrBurst, 1),
+			File:     t.config.AddrGateFile,
+		}
+	})
+	return t.gate
 }

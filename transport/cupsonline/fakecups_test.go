@@ -53,16 +53,35 @@ type fakeCups struct {
 	limitTokens           float64
 	limitLast             time.Time
 	refused               int
+	// limitN > 0 is the address's budget the way cups.online keeps it live:
+	// limitN RPCs in any limitWindow, the ones over it refused (and not
+	// counted).
+	limitN      int
+	limitWindow time.Duration
+	limitTimes  []time.Time
 }
 
 // overLimit spends one RPC from the address's budget; true when there is none.
 func (f *fakeCups) overLimit() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	now := time.Now()
+	if f.limitN > 0 {
+		i := 0
+		for i < len(f.limitTimes) && now.Sub(f.limitTimes[i]) >= f.limitWindow {
+			i++
+		}
+		f.limitTimes = f.limitTimes[i:]
+		if len(f.limitTimes) >= f.limitN {
+			f.refused++
+			return true
+		}
+		f.limitTimes = append(f.limitTimes, now)
+		return false
+	}
 	if f.limitRate <= 0 {
 		return false
 	}
-	now := time.Now()
 	if f.limitLast.IsZero() {
 		f.limitTokens = f.limitBurst
 	} else {
@@ -376,6 +395,7 @@ func fastConfig() CupsonlineConfig {
 	c.WSHandshakeTimeout = 2 * time.Second
 	c.StatsInterval = time.Hour
 	c.SendInterval = 0 // no throttling against the in-process fake
+	c.AddrRate = 0     // nor the address's budget (its own test sets it)
 	return c
 }
 
