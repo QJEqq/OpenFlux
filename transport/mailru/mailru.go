@@ -82,11 +82,11 @@ type DocSession struct {
 	readyOnce sync.Once
 
 	// authed is closed once the server has accepted this connection's editor
-	// auth (it sends type:"auth" result:1). A make-before-break rotation waits
-	// for it before moving outgoing traffic onto the new connection, so a packet
-	// is never sent on a connection the server will not yet relay (which would
-	// otherwise be lost until the Session ARQ retransmits a whole RTO later — a
-	// visible stall). See markAuthed and rotateCarrier.
+	// auth (it sends type:"auth" result:1). A standby connection waits for it
+	// before the writer may move outgoing traffic onto it, so a packet is never
+	// sent on a connection the server will not yet relay (which would otherwise
+	// be lost until the Session ARQ retransmits a whole RTO later — a visible
+	// stall). See markAuthed and prepareStandby.
 	authed     chan struct{}
 	authedOnce sync.Once
 
@@ -97,15 +97,24 @@ type DocSession struct {
 	// keep delivering safely during the grace, so there is no receive gap.
 	retired atomic.Bool
 
-	// sentCount is the number of chat frames written on this connection. The R7
-	// server cuts an anonymous editor's socket with disconnectReason 4004
-	// ("access deny") after a per-connection chat-message budget is spent —
-	// measured live at ~160-220 messages, independent of size, so under load it
-	// is reached in tens of seconds, before the ~45s time kick. writerLoop
-	// rotates make-before-break once this reaches mailruRotateMsgs (well under
-	// the budget), so the cut never happens. It also lets a drop be attributed
-	// to the message budget (readLoop logs the count at the drop).
+	// sentCount and sentText are the chat messages and the bytes of them written
+	// on this connection: the R7 server cuts a connection whose text goes past
+	// mailruConnBudget (see there), so writerLoop moves to a standby connection
+	// before that; readLoop logs both at a drop.
 	sentCount atomic.Int64
+	sentText  atomic.Int64
+
+	// tokens is the connection's message allowance (mailruMsgBurst, refilled at
+	// mailruMsgRate since tokensAt). Only writerLoop touches them.
+	tokens   float64
+	tokensAt time.Time
+
+	// lastTail is the end of the last message written here and echoed is set
+	// when the server's broadcast of it comes back on this connection: the
+	// server has taken it, so a message sent next on another connection cannot
+	// overtake it (see noteEcho, awaitEcho).
+	lastTail atomic.Pointer[string]
+	echoed   atomic.Bool
 
 	// active marks the one session whose reader delivers received frames.
 	// Exactly one is active at a time, so a rotation never delivers a frame
@@ -289,9 +298,35 @@ type MailruDocsTransport struct {
 	// live connection rather than to process start.
 	sessionStart atomic.Int64
 
-	// rotating guards against launching a second make-before-break rotation
-	// while one is already in flight.
-	rotating atomic.Bool
+	// standby is a connection dialed and authenticated ahead of need: the writer
+	// moves to it when the active one cannot take the next message (its text
+	// budget or message allowance spent), make-before-break, without waiting for
+	// a dial. preparing guards the one dial in flight; a failed dial pushes the
+	// next one out to nextDial (dialFails in a row double the wait).
+	standby   atomic.Pointer[DocSession]
+	preparing atomic.Bool
+	dialFails atomic.Int32
+	nextDial  atomic.Int64
+	// moveWanted asks the writer to move to the standby at the next message
+	// even though the connection has room (rotationLoop: it is old).
+	moveWanted atomic.Bool
+
+	// docInfo resolves the document to the editor's WebSocket and auth; it is
+	// fetchDocInfo, replaced in tests by a fake editor.
+	docInfo func(weblink string) (MailruDocsInfo, error)
+
+	// The writer's knobs, taken from the package's at construction so a test can
+	// set its own without racing the transport's goroutines.
+	msgInterval time.Duration
+	standbyAt   int64
+	dialBurst   float64
+	dialRate    float64
+
+	// dialTokens is the standby dial pace (dialBurst, refilled at dialRate since
+	// dialAt), under dialMu: the writer and the reader both ask for standbys.
+	dialMu     sync.Mutex
+	dialTokens float64
+	dialAt     time.Time
 
 	// ourIDs holds every anonymous editor id this transport has authenticated as
 	// (one per carrier connection; the server assigns a fresh one each time).
@@ -305,6 +340,21 @@ type MailruDocsTransport struct {
 	// the auth reply. A signed-in account has one editor id for all its connections (useridoriginal), so a frame
 	// from the account's other connection, the node of the same account, is told from our echo only by this one.
 	ourConns sync.Map
+}
+
+// Stop stops the transport and closes its connections to the document.
+func (t *MailruDocsTransport) Stop() error {
+	err := t.BaseTransport.Stop()
+	t.Mu.RLock()
+	active := t.session
+	t.Mu.RUnlock()
+	for _, s := range []*DocSession{active, t.standby.Swap(nil)} {
+		if s != nil && s.Conn != nil {
+			s.retired.Store(true)
+			_ = s.Conn.Close()
+		}
+	}
+	return err
 }
 
 // SetErrorNotifier installs the out-of-band error callback (interface
@@ -328,6 +378,9 @@ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *M
 		BaseTransport: transport.NewBaseTransport(config),
 		weblink:       normalizeWeblink(weblink),
 	}
+	t.docInfo = t.fetchDocInfo
+	t.msgInterval, t.standbyAt = mailruMsgInterval, mailruStandbyAt
+	t.dialBurst, t.dialRate = mailruDialBurst, mailruDialRate
 	t.baseUserID = randUserID()
 	jar, _ := cookiejar.New(nil)
 	t.cookieJar = jar
@@ -376,8 +429,8 @@ func (t *MailruDocsTransport) Start() error {
 	// such write. The Engine.IO ping/pong (handled in handleMessage) keeps the WS up.
 	t.connectToDoc(0)
 
-	// Preemptively rotate the carrier before the server's ~45s drop under load
-	// (make-before-break, no tunnel gap). See rotationLoop / rotateCarrier.
+	// Refresh a long-lived connection now and then (make-before-break, no
+	// tunnel gap). See rotationLoop.
 	if mailruRotateInterval > 0 {
 		utils.SafeGo("mailru.rotation", t.rotationLoop)
 	}
@@ -385,101 +438,108 @@ func (t *MailruDocsTransport) Start() error {
 	return nil
 }
 
-// mailruPreferredBatchBytes is the default coalescing batch size for the chat
-// carrier. The R7 server cuts an anonymous editor connection with 4004 after
-// ~12 chat messages regardless of their size, so a large batch fits far more
-// tunnel data into that fixed message budget before the reconnect. Measured
-// end-to-end (d14 exit <-> 212 client, cachefly 10 MB via socks5h): the 8 KB
-// default gave the old tens-of-KB/s; ~500 KB reaches ~860 KB/s per burst, while
-// 1 MB is slower and far more variable (a bigger loss unit per 4004 cut).
+// The R7 server's limits on one carrier connection, measured live on
+// 2026-11-18 (one connection sending at a fixed rate, rotation off):
+//
+//   - It takes mailruConnBudget of chat text in all. The message that would take
+//     the text sent on a connection past 256 KiB is answered with
+//     disconnectReason 4004 ("access deny") and the socket closes: 12 payloads of
+//     16 KB (256 000 bytes of base64) pass and the 13th is cut, the same at one a
+//     second as at one every four seconds; 6 of 32 KB pass and the 7th is cut, 3
+//     of 64 KB and the 4th; a single 200 KB payload (266 667 bytes of base64) is
+//     cut at once. Time does not give it back, and what the connection receives
+//     does not count (a silent connection took in 288 KB and stayed).
+//   - Messages: about 20 at once, then about one a second. 3 a second was cut
+//     after 30 messages, 2 a second after 39; 1 and 1.2 a second ran on.
+//   - Both are per connection: two connections of one account at 1.2 a second
+//     each ran on, and a new connection starts with a fresh allowance. Opening
+//     connections one after another, 27 a minute, met no refusal.
+//
+// The transport used to send 500 KB batches at up to 5 a second and rotate after
+// 60 messages or 25 s, on an older budget (80-220 messages): every big batch and
+// every burst cost a connection, then up to 21 s of reconnect backoff — about
+// 10 KB/s was left of the tunnel. Now each connection keeps a count of what it
+// has sent and of its message allowance, and the writer moves to a standby
+// connection, dialed ahead, before it would go over either.
+const (
+	mailruConnBudget = 256 << 10
+	// mailruSendStop is where a connection stops taking messages: the auth,
+	// the frames around the chat text and the pings go to the server too.
+	mailruSendStop = mailruConnBudget - 16<<10
+	// mailruMsgBurst / mailruMsgRate is the message allowance a connection is
+	// kept to, under the server's ~20 / ~1 a second.
+	mailruMsgBurst = 15
+	mailruMsgRate  = 0.9
+	// mailruMsgLow: with fewer messages left than this a standby is dialed, so
+	// a chatty stretch moves to a fresh allowance instead of waiting for one.
+	mailruMsgLow = 4
+	// mailruDialBurst / mailruDialRate keep one transport's standby dials from
+	// coming in bursts: the editor answers 429 to WebSocket handshakes that come
+	// too often. Live, both ends of a tunnel on one address dialing ~25 a minute
+	// had ~30 % refused, ~17 a minute getting through; each refusal stalls the
+	// writer for its backoff. A standby is dialed only when a connection runs
+	// low — a ready one also takes in every broadcast, a second copy of the
+	// traffic.
+	mailruDialBurst = 6
+	mailruDialRate  = 20.0 / 60
+)
+
+// mailruStandbyAt is how much a connection has sent when a standby connection
+// is dialed for when it is spent, so the swap does not wait for a dial.
+// OPENFLUX_MAILRU_STANDBY_KB overrides it.
+var mailruStandbyAt = int64(envInt("OPENFLUX_MAILRU_STANDBY_KB", 64)) << 10
+
+// mailruStandbyWait bounds how long the writer holds a message for a standby
+// that cannot be dialed (a refusal, the network): then it sends on the spent
+// connection anyway, the server cuts it and the ordinary reconnect takes over.
+const mailruStandbyWait = 20 * time.Second
+
+// mailruWriteQueue is how many frames wait for the writer. Few on purpose: a
+// full queue holds the batcher above, which then packs everything that arrives
+// meanwhile into its next frame — one message instead of many.
+const mailruWriteQueue = 4
+
+// mailruPreferredBatchBytes is the batch size for the chat carrier: a connection
+// takes ~240 KiB of text (mailruSendStop) and a message ~4/3 of its batch, so a
+// 32 KiB batch leaves ~5 messages to a connection — well inside its message
+// allowance, so it is the text that ends a connection, not the count. (16 KiB
+// filled a connection a little better but ran out of allowance first live.)
 // OPENFLUX_BATCH_BYTES overrides this (see transport.BatchSizeHinter).
-const mailruPreferredBatchBytes = 500_000
+const mailruPreferredBatchBytes = 32 << 10
 
 // PreferredBatchBytes implements transport.BatchSizeHinter.
 func (t *MailruDocsTransport) PreferredBatchBytes() int { return mailruPreferredBatchBytes }
 
 // defaultMailruMsgIntervalMs is the minimum gap between chat writes on one
-// carrier connection. The R7 4004 budget behaves like a message token bucket
-// (capacity ~80-90, refill ~2/s, measured live): a steady trickle is fine, but
-// a BURST empties it in a few seconds and the server cuts the socket (4004).
-// The burst source under load is the Session ARQ's retransmits — after any
-// hiccup it refills the write queue at tens of messages/s. Capping the write
-// rate (200 ms = 5/s) flattens that burst so the bucket is never drained faster
-// than a make-before-break rotation (mailruRotateMsgs) can swap in a fresh
-// connection, which is what finally stopped the exit's 4004 churn under an 8x
-// download. 5/s still far exceeds the real send rate the server throttle allows
-// (~1-2 x 500 KB batches/s), so it does not cap throughput. 0 disables pacing.
-// OPENFLUX_MAILRU_MSG_INTERVAL_MS overrides it.
+// carrier connection: it spreads a retransmit burst over a few hundred ms on top
+// of the message allowance. 0 disables it. OPENFLUX_MAILRU_MSG_INTERVAL_MS
+// overrides it.
 const defaultMailruMsgIntervalMs = 200
 
-var mailruMsgInterval = func() time.Duration {
-	n := defaultMailruMsgIntervalMs
-	if v := os.Getenv("OPENFLUX_MAILRU_MSG_INTERVAL_MS"); v != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
-			n = parsed
-		}
-	}
-	return time.Duration(n) * time.Millisecond
-}()
+var mailruMsgInterval = time.Duration(envInt("OPENFLUX_MAILRU_MSG_INTERVAL_MS", defaultMailruMsgIntervalMs)) * time.Millisecond
 
-// defaultMailruRotateMs is the connection age at which the carrier WebSocket is
-// preemptively rotated make-before-break (see rotateCarrier/rotationLoop). The
-// R7 server drops an anonymous editor's socket at a fixed age under load —
-// ~45s, matching Engine.IO pingInterval 25s + pingTimeout 20s — and that drop
-// stalls the single-lane tunnel ("отваливается под нагрузкой"). Neither send
-// pacing nor decoupling the reader stopped it (the receive-queue drops stayed
-// 0, so the reader was never blocked), which points at the server kick rather
-// than a client stall. Rotating a fresh connection in before the old one is
-// ever kicked keeps every connection well under that age, so the tunnel never
-// waits on the kick. 25s leaves a wide margin under ~45s (room for a slow or
-// retried rotation to finish before the kick) while keeping the editor-API
-// connect rate low (~2-3/min) to stay under its throttle. rotationLoop retries
-// a failed rotation every couple of seconds, so a transient API hiccup does not
-// let the old connection reach the kick. 0 disables rotation.
-// OPENFLUX_MAILRU_ROTATE_MS overrides it.
-const defaultMailruRotateMs = 25000
+// defaultMailruRotateMs is the connection age at which the carrier moves to a
+// fresh connection even if it has sent little. Live, a connection sending 1 KB a
+// second ran 90 s and a silent one 50 s without a cut — the old "~45 s drop
+// under load" was the text budget — so this is only a long-lived refresh.
+// 0 disables it. OPENFLUX_MAILRU_ROTATE_MS overrides it.
+const defaultMailruRotateMs = 5 * 60 * 1000
 
-var mailruRotateInterval = func() time.Duration {
-	n := defaultMailruRotateMs
-	if v := os.Getenv("OPENFLUX_MAILRU_ROTATE_MS"); v != "" {
-		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
-			n = parsed
-		}
-	}
-	return time.Duration(n) * time.Millisecond
-}()
+var mailruRotateInterval = time.Duration(envInt("OPENFLUX_MAILRU_ROTATE_MS", defaultMailruRotateMs)) * time.Millisecond
 
-// mailruRotateAuthWait bounds how long a rotation waits for the server to accept
-// the new connection's auth before swapping sends onto it. A healthy auth
-// round-trip is well under a second; the cap only guards against a stuck new
-// connection (then we swap anyway and let the normal drop/reconnect recover).
+// mailruRotateAuthWait bounds how long a new connection may take to have its
+// auth accepted before it is given up.
 const mailruRotateAuthWait = 8 * time.Second
 
-// defaultMailruRotateMsgs rotates the carrier make-before-break once this many
-// chat frames have been written on it, staying under the R7 server's anti-abuse
-// budget. The server cuts the connection with disconnectReason 4004 ("access
-// deny") when that budget is spent — it behaves like a message token bucket of
-// capacity ~80-90 (measured live, d14<->212 8x download: a connection sending
-// in a burst was cut at 81-91 messages in ~4 s; a slower one lasted to ~160-220
-// over tens of seconds as the bucket refilled). 60 keeps a margin under the
-// worst-case ~80 capacity even allowing for the handful of extra messages sent
-// while a rotation is still being set up. Paired with the send pacing above
-// (which stops a retransmit burst from blowing the bucket mid-rotation), this
-// took the exit's 4004 cuts under an 8x download from ~11 per run to 0. At
-// ~1-2 x 500 KB batches/s under the server throttle it rotates roughly every
-// 30-60 s. 0 disables count-based rotation (time only).
-// OPENFLUX_MAILRU_ROTATE_MSGS overrides it.
-const defaultMailruRotateMsgs = 60
-
-var mailruRotateMsgs = func() int64 {
-	n := int64(defaultMailruRotateMsgs)
-	if v := os.Getenv("OPENFLUX_MAILRU_ROTATE_MSGS"); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed >= 0 {
-			n = parsed
+// envInt reads a non-negative integer knob from the environment.
+func envInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
 		}
 	}
-	return n
-}()
+	return def
+}
 
 func (t *MailruDocsTransport) Send(data []byte) error {
 	if !t.IsConnected() {
@@ -499,9 +559,25 @@ func (t *MailruDocsTransport) Send(data []byte) error {
 		t.RecordSend(len(data))
 		return nil
 	default:
+	}
+	// The queue is short on purpose (mailruWriteQueue): hold the sender a little
+	// for room, as the writer waits out a connection's limits, so the batcher
+	// above packs what arrives meanwhile instead of retrying every few ms.
+	timer := time.NewTimer(mailruSendHold)
+	defer timer.Stop()
+	select {
+	case session.WriteQueue <- data:
+		t.RecordSend(len(data))
+		return nil
+	case <-timer.C:
 		return fmt.Errorf("write queue full")
+	case <-t.Done():
+		return fmt.Errorf("transport stopped")
 	}
 }
+
+// mailruSendHold is how long Send waits for room in the write queue.
+const mailruSendHold = 100 * time.Millisecond
 
 func (t *MailruDocsTransport) connectToDoc(attempt int) {
 	if !t.IsRunning() {
@@ -561,14 +637,14 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 // dialAndAuth opens a fresh carrier WebSocket, completes the Engine.IO/Socket.IO
 // handshake and sends the editor auth, returning a session whose read loop has
 // not yet been started and which is not yet installed as the active session. It
-// is the shared body of the first connect, a reconnect and a make-before-break
-// rotation. userID is reused across reconnects/rotations (one editor identity);
+// is the shared body of the first connect, a reconnect and a standby connection.
+// userID is reused across reconnects and standbys (one editor identity);
 // writeQueue, when non-nil, is reused so queued packets survive the swap. On any
 // failure it leaves no connection open and returns the error; the caller decides
 // whether to reconnect (connectToDoc) or keep the current carrier
-// (rotateCarrier).
+// (prepareStandby).
 func (t *MailruDocsTransport) dialAndAuth(userID string, writeQueue chan []byte) (*DocSession, error) {
-	info, err := t.fetchDocInfo(t.weblink)
+	info, err := t.docInfo(t.weblink)
 	if err != nil {
 		return nil, fmt.Errorf("fetchDocInfo: %w", err)
 	}
@@ -606,7 +682,7 @@ func (t *MailruDocsTransport) dialAndAuth(userID string, writeQueue chan []byte)
 	utils.Debugf("[M-DOCS] WebSocket connected")
 
 	if writeQueue == nil {
-		writeQueue = make(chan []byte, t.GetConfig().MaxQueueSize)
+		writeQueue = make(chan []byte, mailruWriteQueue)
 	}
 
 	session := &DocSession{
@@ -693,11 +769,12 @@ func (t *MailruDocsTransport) installSession(session *DocSession) {
 }
 
 // readLoop reads one carrier connection until it fails or the transport stops.
-// On a read error it reconnects only if this session is still the active one and
-// was not retired by a rotation (a retired connection's replacement is already
-// live, so it exits silently, no reconnect). A retired session also stops
-// delivering frames: its anonymous editor id differs from the new connection's,
-// so it can no longer filter the new connection's own echoes out of the data.
+// When the active connection fails, a standby that is up takes over at once;
+// without one the transport reconnects. A retired connection (the carrier moved
+// off it) and a standby that fails before it is used exit quietly. A retired
+// session also stops delivering frames: its anonymous editor id differs from the
+// new connection's, so it can no longer filter the new connection's own echoes
+// out of the data.
 func (t *MailruDocsTransport) readLoop(session *DocSession, attempt int) {
 	conn := session.Conn
 	connectedAt := time.Now()
@@ -708,38 +785,211 @@ func (t *MailruDocsTransport) readLoop(session *DocSession, attempt int) {
 				utils.Debugf("[M-DOCS] retired carrier closed: %v", err)
 				return
 			}
+			_ = conn.Close()
+			if t.standby.CompareAndSwap(session, nil) {
+				utils.Debugf("[M-DOCS] standby carrier closed before use: %v", err)
+				return
+			}
+			t.Mu.RLock()
+			active := t.session == session
+			t.Mu.RUnlock()
+			if !active {
+				return
+			}
 			utils.Debugf("[M-DOCS] Read error: %v", err)
 			if utils.Throttled("m-docs.drop", time.Minute) {
-				utils.Infof("[M-DOCS] connection to the document dropped after %d sends, age %s: %v; reconnecting",
-					session.sentCount.Load(), time.Since(connectedAt).Round(time.Second), err)
+				utils.Infof("[M-DOCS] connection to the document dropped after %d messages (%d KB), age %s: %v",
+					session.sentCount.Load(), session.sentText.Load()>>10, time.Since(connectedAt).Round(time.Second), err)
+			}
+			if t.swapToStandby(session) {
+				t.RecordReconnect() // a drop, though nothing waited for a dial
+				return
 			}
 			t.Mu.Lock()
-			stillActive := t.session == session
-			if stillActive {
+			active = t.session == session
+			if active {
 				t.SetConnected(false)
 			}
 			t.Mu.Unlock()
-			_ = conn.Close()
-			if stillActive {
-				next := attempt
-				if time.Since(connectedAt) > 15*time.Second {
-					next = -1
-				}
-				t.scheduleReconnect(next)
+			if !active {
+				return
 			}
+			// A connection the server took (auth accepted) and kept a while was a
+			// success: the next reconnect is quick again.
+			next := attempt
+			if isClosed(session.authed) && time.Since(connectedAt) > 3*time.Second {
+				next = -1
+			}
+			t.scheduleReconnect(next)
 			return
 		}
 		if session.retired.Load() {
+			t.noteEcho(session, message)
 			continue
 		}
 		t.handleMessage(session, message)
 	}
 }
 
-// rotationLoop preemptively rotates the carrier once the active connection
-// reaches mailruRotateInterval, staying ahead of the R7 server's ~45s drop of an
-// anonymous editor under load. It works off the live connection's age
-// (sessionStart), so an ordinary reconnect resets the clock too.
+// noteEcho marks session's last message as echoed when the server's broadcast of
+// it comes back on that connection.
+func (t *MailruDocsTransport) noteEcho(session *DocSession, data []byte) {
+	if session.echoed.Load() {
+		return
+	}
+	if tail := session.lastTail.Load(); tail != nil && bytes.Contains(data, []byte(*tail)) {
+		session.echoed.Store(true)
+	}
+}
+
+// mailruEchoWait bounds how long a move to the standby waits for the echo of the
+// last message on the old connection (a server that does not echo, a lost one).
+const mailruEchoWait = 1500 * time.Millisecond
+
+// awaitEcho holds the writer until the server has echoed session's last message,
+// or mailruEchoWait passes.
+func (t *MailruDocsTransport) awaitEcho(session *DocSession) {
+	deadline := time.Now().Add(mailruEchoWait)
+	for session.lastTail.Load() != nil && !session.echoed.Load() && time.Now().Before(deadline) && t.IsRunning() {
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// mailruRetireGrace is how long a connection the carrier moved off stays open:
+// closing a socket with data still unread makes the kernel reset it, and the
+// server would then drop our last messages it had not read yet.
+const mailruRetireGrace = 2 * time.Second
+
+func isClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// swapToStandby moves the carrier from old to the standby connection, if one is
+// up: the standby becomes the active (delivering) connection and old is retired
+// and closed. Every chat reaches all our connections, so the standby has been
+// receiving what old did; having exactly one deliverer avoids the duplicate ACKs
+// that would make the far side fast-retransmit. False when there is no standby
+// or old is no longer the active connection.
+func (t *MailruDocsTransport) swapToStandby(old *DocSession) bool {
+	t.Mu.Lock()
+	if t.session != old {
+		t.Mu.Unlock()
+		return false
+	}
+	next := t.standby.Swap(nil)
+	if next == nil {
+		t.Mu.Unlock()
+		return false
+	}
+	old.active.Store(false)
+	next.active.Store(true)
+	t.session = next
+	t.SetConnected(true)
+	t.Mu.Unlock()
+	t.sessionStart.Store(time.Now().UnixNano())
+	old.retired.Store(true)
+	if old.Conn != nil {
+		conn := old.Conn
+		time.AfterFunc(mailruRetireGrace, func() { _ = conn.Close() })
+	}
+	utils.Debugf("[M-DOCS] carrier moved to the standby after %d messages, %d KB", old.sentCount.Load(), old.sentText.Load()>>10)
+	return true
+}
+
+// moveToStandby is the writer's move off a connection that cannot take its next
+// message: after the server has echoed the last one sent there, so the order of
+// the messages survives the change of connection.
+func (t *MailruDocsTransport) moveToStandby(old *DocSession) bool {
+	if t.standby.Load() == nil {
+		return false
+	}
+	t.awaitEcho(old)
+	return t.swapToStandby(old)
+}
+
+// prepareStandby dials a standby connection in the background, unless one is up
+// or on its way, or a failed dial asked to wait (nextDial). The standby reads
+// from the start (its auth, the pings, every broadcast) but delivers only once
+// the writer moves to it.
+func (t *MailruDocsTransport) prepareStandby(active *DocSession) {
+	if !t.IsRunning() || t.standby.Load() != nil || time.Now().UnixNano() < t.nextDial.Load() {
+		return
+	}
+	if !t.preparing.CompareAndSwap(false, true) {
+		return
+	}
+	if wait := t.takeDial(time.Now()); wait > 0 {
+		t.nextDial.Store(time.Now().Add(wait).UnixNano())
+		t.preparing.Store(false)
+		return
+	}
+	utils.SafeGo("mailru.standby", func() {
+		defer t.preparing.Store(false)
+		s, err := t.dialAndAuth(active.UserID, active.WriteQueue)
+		if err == nil {
+			utils.SafeGo("mailru.read", func() { t.readLoop(s, 0) })
+			select {
+			case <-s.authed:
+			case <-time.After(mailruRotateAuthWait):
+				err = fmt.Errorf("auth not accepted in %v", mailruRotateAuthWait)
+			case <-t.Done():
+				err = errors.New("stopped")
+			}
+			if err != nil {
+				s.retired.Store(true)
+				_ = s.Conn.Close()
+			}
+		}
+		if err != nil {
+			wait := standbyBackoff(t.dialFails.Add(1))
+			t.nextDial.Store(time.Now().Add(wait).UnixNano())
+			utils.Debugf("[M-DOCS] standby connection failed (%v); next try in %v", err, wait)
+			if utils.Throttled("m-docs.standby", time.Minute) {
+				utils.Infof("[M-DOCS] standby connection failed (%v); next try in %v", err, wait)
+			}
+			return
+		}
+		t.dialFails.Store(0)
+		if !t.IsRunning() || !t.standby.CompareAndSwap(nil, s) {
+			s.retired.Store(true)
+			_ = s.Conn.Close()
+			return
+		}
+		utils.Debugf("[M-DOCS] standby carrier ready")
+	})
+}
+
+// takeDial spends one standby dial of the pace, or returns how long until there
+// is one.
+func (t *MailruDocsTransport) takeDial(now time.Time) time.Duration {
+	t.dialMu.Lock()
+	defer t.dialMu.Unlock()
+	if t.dialAt.IsZero() {
+		t.dialTokens, t.dialAt = t.dialBurst, now
+	}
+	t.dialTokens = min(t.dialBurst, t.dialTokens+now.Sub(t.dialAt).Seconds()*t.dialRate)
+	t.dialAt = now
+	if t.dialTokens >= 1 {
+		t.dialTokens--
+		return 0
+	}
+	return time.Duration((1 - t.dialTokens) / t.dialRate * float64(time.Second))
+}
+
+// standbyBackoff is the wait before the next standby dial after n failures in a
+// row: 2 s, 4 s, 8 s, then 15 s (a refused dial is often the server's 429).
+func standbyBackoff(n int32) time.Duration {
+	return min((2*time.Second)<<min(max(n-1, 0), 3), 15*time.Second)
+}
+
+// rotationLoop moves the carrier to a fresh connection once the active one is
+// mailruRotateInterval old, even if it has sent little: a standby is dialed and
+// the writer moves to it at its next message.
 func (t *MailruDocsTransport) rotationLoop() {
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
@@ -758,72 +1008,37 @@ func (t *MailruDocsTransport) rotationLoop() {
 			t.Mu.RLock()
 			s := t.session
 			t.Mu.RUnlock()
-			if s == nil {
-				continue
-			}
-			if t.rotating.CompareAndSwap(false, true) {
-				old := s
-				utils.SafeGo("mailru.rotate", func() { t.rotateCarrier(old) })
+			if s != nil {
+				t.moveWanted.Store(true)
+				t.prepareStandby(s)
 			}
 		}
 	}
 }
 
-// rotateCarrier performs a make-before-break rotation with no visible seam: it
-// brings up and authenticates a fresh carrier connection while old still carries
-// traffic, starts reading it, and waits for the server to accept its auth before
-// moving outgoing traffic onto it (so a packet is never sent on a connection the
-// server will not yet relay — which would stall a whole RTO). At the swap the
-// new connection becomes the delivering one and old is retired and closed at
-// once: old keeps nothing in flight that new will not also receive (every chat
-// is broadcast to all our connections), and having exactly one deliverer avoids
-// the duplicate ACKs that would make the far side fast-retransmit. writerLoop
-// and Send follow t.session and share the write queue, so no queued packet is
-// lost. If the new connection cannot be established, old is left untouched and
-// the normal drop/reconnect path remains the fallback; rotationLoop retries soon.
-func (t *MailruDocsTransport) rotateCarrier(old *DocSession) {
-	defer t.rotating.Store(false)
-	if !t.IsRunning() {
-		return
+// takeToken spends one of the connection's message allowance, or returns how
+// long until there is one.
+func (s *DocSession) takeToken(now time.Time) time.Duration {
+	if s.tokensAt.IsZero() {
+		s.tokens, s.tokensAt = mailruMsgBurst, now
 	}
-	utils.Debugf("[M-DOCS] rotating carrier (age >= %v)", mailruRotateInterval)
-
-	session, err := t.dialAndAuth(old.UserID, old.WriteQueue)
-	if err != nil {
-		utils.Debugf("[M-DOCS] rotation failed, keeping current carrier: %v", err)
-		return
+	s.tokens = min(mailruMsgBurst, s.tokens+now.Sub(s.tokensAt).Seconds()*mailruMsgRate)
+	s.tokensAt = now
+	if s.tokens >= 1 {
+		s.tokens--
+		return 0
 	}
-
-	// Start reading the new connection so it processes its auth and receives
-	// peer frames, but keep sending on old until the server has accepted the new
-	// one. Both readers deliver during this window; the multi-identity echo
-	// filter keeps either from re-delivering our own frames.
-	utils.SafeGo("mailru.read", func() { t.readLoop(session, 0) })
-	select {
-	case <-session.authed:
-	case <-time.After(mailruRotateAuthWait):
-		utils.Debugf("[M-DOCS] rotation: new carrier auth not confirmed in %v; swapping anyway", mailruRotateAuthWait)
-	case <-t.Done():
-		session.retired.Store(true)
-		if session.Conn != nil {
-			_ = session.Conn.Close()
-		}
-		return
-	}
-
-	// Swap: the new connection becomes active (and starts delivering) and old
-	// stops delivering, in one step. Then retire and close old at once — new
-	// already receives every broadcast, so there is nothing to wait for.
-	old.active.Store(false)
-	t.installSession(session)
-	old.retired.Store(true)
-	if old.Conn != nil {
-		_ = old.Conn.Close()
-	}
-	t.RecordReconnect()
-	utils.Debugf("[M-DOCS] carrier rotated")
+	return time.Duration((1 - s.tokens) / mailruMsgRate * float64(time.Second))
 }
 
+// writerLoop writes the queued frames to the document's chat, one message each,
+// on the active connection. It keeps every connection inside the server's
+// limits (see mailruConnBudget): a message that would take the connection's text
+// past mailruSendStop, or find its message allowance spent, goes on the standby
+// connection instead — dialed once the connection has sent mailruStandbyAt or
+// has fewer than mailruMsgLow messages left — and waits for it if it is not up
+// yet. Meanwhile the write queue stays full and
+// the batcher above packs what arrives into its next frame.
 func (t *MailruDocsTransport) writerLoop() {
 	var queue chan []byte
 	for t.IsRunning() && queue == nil {
@@ -840,15 +1055,29 @@ func (t *MailruDocsTransport) writerLoop() {
 		return
 	}
 
-	var pending []byte
-	var lastWrite time.Time
+	var msg []byte
+	var tail string
+	var lastWrite, held time.Time
 	for t.IsRunning() {
-		if pending == nil {
-			packet, ok := <-queue
-			if !ok {
+		if msg == nil {
+			select {
+			case packet, ok := <-queue:
+				if !ok {
+					return
+				}
+				// Tunnel data rides the document's chat channel: the server
+				// broadcasts a chat "message" verbatim to every other participant
+				// and does not validate its text against the document model (unlike
+				// cursor/saveChanges, which it now rejects). We tag the base64
+				// payload so our frames are told apart from a human's chat and from
+				// the server's echo of our own messages.
+				payload := chatDataTag + base64.StdEncoding.EncodeToString(packet)
+				msg = []byte(fmt.Sprintf(`42["message",{"type":"message","message":%q}]`, payload))
+				tail = payload[max(0, len(payload)-48):]
+				held = time.Time{}
+			case <-t.Done():
 				return
 			}
-			pending = packet
 		}
 
 		t.Mu.RLock()
@@ -859,42 +1088,58 @@ func (t *MailruDocsTransport) writerLoop() {
 			continue
 		}
 
-		// Pace the chat-message rate to flatten retransmit bursts so they do
-		// not drain R7's 4004 message token bucket faster than a rotation can
-		// swap in a fresh connection (see mailruMsgInterval / mailruRotateMsgs).
-		// Backpressure propagates — a full WriteQueue makes Send fail and the
-		// batcher holds the batch.
-		if mailruMsgInterval > 0 && !lastWrite.IsZero() {
-			if wait := mailruMsgInterval - time.Since(lastWrite); wait > 0 {
+		n := int64(len(msg))
+		now := time.Now()
+		if t.moveWanted.Load() && t.moveToStandby(session) {
+			t.moveWanted.Store(false)
+			continue
+		}
+		if session.sentText.Load()+n > mailruSendStop {
+			if t.moveToStandby(session) {
+				continue
+			}
+			if held.IsZero() {
+				held = now
+			}
+			if now.Sub(held) < mailruStandbyWait {
+				t.prepareStandby(session)
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			// No standby for that long: send on the spent connection, the server
+			// cuts it and the reader reconnects (and reports a login wall).
+			if utils.Throttled("m-docs.spent", time.Minute) {
+				utils.Infof("[M-DOCS] no standby connection in %v; sending on the spent one", mailruStandbyWait)
+			}
+		}
+		if wait := session.takeToken(now); wait > 0 {
+			if t.moveToStandby(session) {
+				continue
+			}
+			time.Sleep(min(wait, 50*time.Millisecond))
+			continue
+		}
+		if t.msgInterval > 0 && !lastWrite.IsZero() {
+			if wait := t.msgInterval - time.Since(lastWrite); wait > 0 {
 				time.Sleep(wait)
 			}
 		}
-
-		// Tunnel data rides the document's chat channel: the server broadcasts a
-		// chat "message" verbatim to every other participant and does not validate
-		// its text against the document model (unlike cursor/saveChanges, which it
-		// now rejects). We tag the base64 payload so our frames are told apart from
-		// a human's chat and from the server's echo of our own messages.
-		payload := chatDataTag + base64.StdEncoding.EncodeToString(pending)
-		msg := fmt.Sprintf(`42["message",{"type":"message","message":%q}]`, payload)
-		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+		session.echoed.Store(false)
+		last := tail // its own string: tail is the writer's, reused for the next message
+		session.lastTail.Store(&last)
+		if err := session.safeWrite(websocket.TextMessage, msg); err != nil {
 			utils.Debugf("[M-DOCS] Write error: %v", err)
 			time.Sleep(15 * time.Millisecond)
 			continue
 		}
 		lastWrite = time.Now()
-		pending = nil
-
-		// Rotate make-before-break once this connection has sent its share of
-		// the server's per-connection message budget, before the server cuts it.
-		// Triggering here (rather than only on a timer) is what keeps a loaded
-		// connection — which burns the budget in seconds — from ever being cut.
-		if n := session.sentCount.Add(1); mailruRotateMsgs > 0 && n == mailruRotateMsgs {
-			if t.rotating.CompareAndSwap(false, true) {
-				s := session
-				utils.SafeGo("mailru.rotate", func() { t.rotateCarrier(s) })
-			}
+		session.sentCount.Add(1)
+		// Dial the standby while this connection still has room: once it has
+		// sent standbyAt, or when its message allowance is nearly spent.
+		if session.sentText.Add(n) >= t.standbyAt || session.tokens < mailruMsgLow {
+			t.prepareStandby(session)
 		}
+		msg = nil
 	}
 }
 
@@ -1008,6 +1253,9 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 	if text == "3" {
 		return
+	}
+	if session != nil {
+		t.noteEcho(session, data)
 	}
 
 	if strings.Contains(text, `"type":"auth"`) && strings.Contains(text, `"result":1`) {
